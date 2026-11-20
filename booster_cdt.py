@@ -81,6 +81,7 @@ class Tramo:
     D_mm: float                         # diámetro interno, mm
     material: str = "PVC"
     K: float = 0.0                      # suma de coef. de pérdidas menores (codos, válvulas...)
+    perfil: Optional[list] = None       # perfil del terreno [(estación m, cota msnm), ...] (opcional)
 
 
 def perdida_tramo(t: Tramo, q_lps: float, metodo: str = "DW", pct_menores: float = 0.0):
@@ -171,10 +172,19 @@ def resolver(red: Red, k: float, cfg: dict) -> dict:
         nd = red.nodos[nid]
         p = nd.p_req_m if nd.p_req_m is not None else cfg["presion_deseada_m"]
         req[nid] = nd.cota + p + acum[nid]
+    # Perfil del terreno (opcional): la línea piezométrica debe quedar sobre CADA punto del perfil
+    p_perfil = cfg.get("presion_min_perfil_m", 0.0)
+    for t in red.tramos:
+        if t.perfil and len(t.perfil) >= 2:
+            pf = sorted(tuple(p) for p in t.perfil)
+            x0, span = pf[0][0], (pf[-1][0] - pf[0][0]) or 1.0
+            perd = det[t.id]["hf"] + det[t.id]["hm"]
+            for x, z in pf:                          # pérdida repartida uniformemente a lo largo del tramo
+                req[f"{t.id}@{x:.0f}m"] = z + p_perfil + acum[t.desde] + perd * (x - x0) / span
     crit = max(req, key=req.get)
     H = req[crit]                                   # cota piezométrica requerida en la descarga
     pres = {n: H - acum[n] - red.nodos[n].cota for n in acum}
-    return {"k": k, "Q": qtot, "H_desc": H, "crit": crit, "det": det, "pres": pres, "acum": acum}
+    return {"k": k, "Q": qtot, "H_desc": H, "crit": crit, "det": det, "pres": pres, "acum": acum, "req": req}
 
 
 # ----------------------------------------------------------------------------
