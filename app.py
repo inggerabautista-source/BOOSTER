@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit as st
 
 import booster_cdt as bc
+import exporta as ex
 
 st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide")
 
@@ -148,7 +149,8 @@ with sb.expander("Límites de verificación (típicos MAPAS; ajusta a tu norma)"
 st.title("Booster con presión constante")
 st.caption("Edita los datos, carga (opcional) el perfil del terreno de cada tramo y revisa los resultados.")
 
-tab_dem, tab_red, tab_perf, tab_res = st.tabs(["1. Gastos", "2. Red", "3. Perfil del terreno", "4. Resultados"])
+tab_dem, tab_red, tab_perf, tab_res, tab_exp = st.tabs(
+    ["1. Gastos", "2. Red", "3. Perfil del terreno", "4. Resultados y esquema", "5. Exportar"])
 
 with tab_dem:
     st.write("Calculadora de gastos de diseño (informativa). Los gastos que usa el cálculo son los de la columna "
@@ -251,6 +253,15 @@ def build_cfg():
     }
 
 
+@st.cache_data(show_spinner="Generando archivos...")
+def genera_export(cfg_json):
+    cfg = json.loads(cfg_json)
+    res = bc.analizar(cfg)
+    return ex.a_pdf(cfg, res), ex.a_excel(cfg, res), ex.a_zip_png(cfg, res)
+
+
+import matplotlib.pyplot as plt  # noqa: E402
+
 with tab_res:
     try:
         cfg = build_cfg()
@@ -258,108 +269,58 @@ with tab_res:
     except Exception as e:                           # noqa: BLE001
         st.error(f"Revisa los datos: {e}")
         st.stop()
-    red, esc = res["red"], res["esc"]
-    dis = max(esc, key=lambda r: r["k"])
-    nb, s = cfg["n_bombas"], cfg["succion"]
-    Q, H = dis["Q"], dis["CDT"]
-    p_hid = bc.G * Q / 1000 * H
-    p_kw = p_hid / (cfg["eficiencia_bomba"] * cfg["eficiencia_motor"])
-    hp = p_kw / bc.HP_KW
-    npshd = (bc.patm_m(s["altitud_m"]) - bc.pvap_m(s["temp_c"]) + (s["nivel_agua"] - s["cota_eje_bomba"])
-             - dis["hf_succ"])
+    red, dis = res["red"], max(res["esc"], key=lambda r: r["k"])
+    nb, lim = cfg["n_bombas"], cfg["limites"]
+    eq, tb = ex.equipo(cfg, res), ex.tablas(cfg, res)
 
     m = st.columns(5)
-    m[0].metric("Capacidad", f"{Q:.1f} lps", f"{Q / nb:.1f} lps/bomba" if nb > 1 else None)
-    m[1].metric("CDT de diseño", f"{H:.2f} m")
-    m[2].metric("Potencia motor", f"{hp:.1f} HP", f"comercial: {bc.motor_comercial(hp * cfg['factor_seguridad_motor'] / nb):g} HP")
-    m[3].metric("NPSH disponible", f"{npshd:.2f} m")
-    m[4].metric("Punto crítico", dis["crit"])
-    if cfg["npsh_requerido"]:
-        marg = npshd - cfg["npsh_requerido"]
-        (st.success if marg >= 1 else st.error)(f"Margen de NPSH: {marg:.2f} m (recomendado ≥ 1 m)")
-    if "@" in dis["crit"]:
-        st.warning(f"El punto que gobierna es un punto intermedio del perfil ({dis['crit']}), no un extremo.")
+    m[0].metric("Capacidad", f"{eq['Q']:.1f} lps", f"{eq['Q'] / nb:.1f} lps/bomba" if nb > 1 else None)
+    m[1].metric("CDT de diseño", f"{eq['H']:.2f} m")
+    m[2].metric("Potencia motor", f"{eq['hp']:.1f} HP", f"comercial: {eq['hp_com']:g} HP")
+    m[3].metric("NPSH disponible", f"{eq['npshd']:.2f} m")
+    m[4].metric("Punto crítico", eq["crit"])
+    if eq["marg"] is not None:
+        (st.success if eq["marg"] >= 1 else st.error)(f"Margen de NPSH: {eq['marg']:.2f} m (recomendado ≥ 1 m)")
+    if "@" in eq["crit"]:
+        st.warning(f"El punto que gobierna es un punto intermedio del perfil ({eq['crit']}), no un extremo.")
 
-    lim = cfg["limites"]
-    filas_t = []
-    for t in red.tramos:
-        d = dis["det"][t.id]
-        obs = "V alta" if d["V"] > lim["v_max"] else ("V baja" if 0 < d["Q"] and d["V"] < lim["v_min"] else "")
-        filas_t.append({"Tramo": t.id, "Q lps": d["Q"], "D mm": t.D_mm, "L m": t.L, "V m/s": d["V"],
-                        "hf m": d["hf"], "hm m": d["hm"], "Obs": obs})
+    st.subheader("Esquema general")
+    st.caption("Qué se calcula: el gasto de cada tramo se obtiene sumando las demandas aguas abajo; con ese gasto se "
+               "calculan velocidad y pérdidas; la presión deseada en el nodo crítico fija la carga en la descarga de "
+               "la bomba; los demás nodos reciben la presión que resulte (si sobra, hay que regular el ramal).")
+    fig_esq = ex.esquema_fig(cfg, res)
+    st.pyplot(fig_esq)
+    plt.close(fig_esq)
+
     st.subheader("Tramos (diseño)")
-    st.dataframe(pd.DataFrame(filas_t).round(2), width="stretch", hide_index=True)
-
-    filas_n = []
-    for nid, p in dis["pres"].items():
-        obs = ""
-        if nid != red.raiz:
-            if p < lim["p_min"] - 1e-6:
-                obs = "BAJA"
-            elif p > lim["p_max"]:
-                obs = "ALTA: válvula reductora"
-            elif nid in red.terminales() and p - cfg["presion_deseada_m"] > 1:
-                obs = f"exceso {p - cfg['presion_deseada_m']:.1f} m: regular ramal"
-        filas_n.append({"Nodo": nid, "Cota": red.nodos[nid].cota, "P m.c.a.": p, "P kg/cm²": p / 10, "Obs": obs})
+    st.dataframe(tb["Tramos"].round(2), width="stretch", hide_index=True)
     st.subheader("Presiones en nodos (sin válvulas reguladoras)")
-    st.dataframe(pd.DataFrame(filas_n).round(2), width="stretch", hide_index=True)
-
-    coefs = bc.ajusta_curva(curva) if curva else None
-    filas_c = []
-    for r in esc:
-        f = {"Q lps": r["Q"], "Q/bomba": r["Q"] / nb, "CDT m": r["CDT"],
-             "P consigna descarga": r["H_desc"] - red.nodos[red.raiz].cota, "Crítico": r["crit"]}
-        if coefs and r["Q"] > 0:
-            rr = bc.velocidad_relativa(coefs, r["Q"] / nb, r["CDT"])
-            f["N/Nnom %"] = round(rr * 100) if rr else None
-        filas_c.append(f)
+    st.dataframe(tb["Nodos"].round(2), width="stretch", hide_index=True)
     st.subheader("Curva del sistema a presión constante")
-    cdf = pd.DataFrame(filas_c).round(2)
-    st.dataframe(cdf, width="stretch", hide_index=True)
+    st.dataframe(tb["Curva sistema"].round(2), width="stretch", hide_index=True)
 
-    import matplotlib.pyplot as plt
     g1, g2 = st.columns(2)
-    fig, ax = plt.subplots(figsize=(5.5, 3.8))
-    ax.plot(cdf["Q lps"], cdf["CDT m"], "o-", label="Sistema")
-    if coefs:
-        xs = [max(cdf["Q lps"]) * 1.3 * i / 50 for i in range(51)]
-        ax.plot(xs, [coefs[0] + coefs[1] * x / nb + coefs[2] * (x / nb) ** 2 for x in xs], "--", label="Bomba 100%")
-    ax.set_xlabel("Q (lps)")
-    ax.set_ylabel("CDT (m)")
-    ax.grid(alpha=.3)
-    ax.legend()
-    g1.pyplot(fig)
-
-    # perfil longitudinal + línea piezométrica hacia un nodo
+    f1 = ex.curva_fig(cfg, res)
+    g1.pyplot(f1)
+    plt.close(f1)
     destino = g2.selectbox("Ver perfil hacia el nodo", red.terminales())
-    camino, n = [], destino
-    padre = {t.hasta: t for t in red.tramos}
-    while n != red.raiz:
-        camino.insert(0, padre[n])
-        n = padre[n].desde
-    xt, zt, xh, zh, xc = [], [], [], [], 0.0
-    for t in camino:
-        d = dis["det"][t.id]
-        h0 = dis["H_desc"] - dis["acum"][t.desde]
-        pts = sorted(map(tuple, t.perfil)) if t.perfil else [
-            (0, red.nodos[t.desde].cota), (t.L, red.nodos[t.hasta].cota)]
-        x0, span = pts[0][0], (pts[-1][0] - pts[0][0]) or 1.0
-        for x, z in pts:
-            xt.append(xc + (x - x0) / span * t.L)
-            zt.append(z)
-        xh += [xc, xc + t.L]
-        zh += [h0, h0 - d["hf"] - d["hm"]]
-        xc += t.L
-    fig2, ax2 = plt.subplots(figsize=(5.5, 3.8))
-    ax2.fill_between(xt, zt, min(zt) - 5, color="#c9b79c", alpha=.6, label="Terreno")
-    ax2.plot(xh, zh, "b-", label="Línea piezométrica")
-    ax2.set_xlabel("Distancia (m)")
-    ax2.set_ylabel("Cota (msnm)")
-    ax2.legend()
-    ax2.grid(alpha=.3)
-    g2.pyplot(fig2)
-
-    st.download_button("Descargar configuración (.json)", json.dumps(cfg, indent=1), "booster_config.json")
-    st.download_button("Descargar curva del sistema (.csv)", cdf.to_csv(index=False), "curva_sistema.csv")
+    f2 = ex.perfil_fig(res, destino)
+    g2.pyplot(f2)
+    plt.close(f2)
     st.caption("Valores por defecto típicos de MAPAS-CONAGUA; confirma con la edición vigente y tu organismo operador. "
                "Revisa también golpe de ariete, válvulas de aire y operación a gasto mínimo.")
+
+with tab_exp:
+    st.write("Exporta la memoria completa: esquema, gráficos, tablas de resultados y datos de entrada.")
+    if st.button("Generar archivos de exportación", type="primary"):
+        ss["exp_cfg"] = json.dumps(cfg)
+    if ss.get("exp_cfg"):
+        if ss["exp_cfg"] != json.dumps(cfg):
+            st.info("Cambiaste datos desde la última generación: vuelve a generar para actualizar los archivos.")
+        pdf_b, xls_b, zip_b = genera_export(ss["exp_cfg"])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.download_button("Memoria PDF", pdf_b, "memoria_booster.pdf", "application/pdf")
+        c2.download_button("Excel (tablas + gráficos)", xls_b, "resultados_booster.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        c3.download_button("Gráficos PNG (.zip)", zip_b, "graficos_booster.zip", "application/zip")
+        c4.download_button("Configuración (.json)", json.dumps(cfg, indent=1), "booster_config.json")
