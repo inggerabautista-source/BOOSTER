@@ -1,75 +1,112 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-booster_cdt.py  -  Dimensionamiento de equipo de bombeo tipo BOOSTER
-                   con red ramificada (varios ramales) y presión constante.
+booster_cdt.py - Motor de cálculo: booster con ramales, presión constante, criterios tipo MAPAS-CONAGUA.
 
-Calcula:
-  * Gastos de diseño (QMD, QMH) con coeficientes de variación tipo MAPAS-CONAGUA
-  * Pérdidas por fricción (Darcy-Weisbach/Swamee-Jain o Hazen-Williams) y menores
-  * Carga dinámica total (CDT) para mantener la presión deseada en el punto
-    más desfavorable (nodo crítico), para varios gastos (curva del sistema)
-  * Presión resultante en cada nodo (detecta excesos -> válvulas reductoras)
-  * Presión de consigna en la descarga de la bomba (control por velocidad variable)
-  * Potencia hidráulica y de motor, NPSH disponible
-  * (Opcional) velocidad relativa del variador a partir de la curva de la bomba
+Incluye: gastos de diseño, geometría comercial (DN, RD), profundidad de zanja y cota de tubería, perfil de
+terreno por tramo, reparto de gasto por ramal (automático por equilibrio hidráulico, % o lps), pérdidas por
+fricción (Darcy-Weisbach / Hazen-Williams), tubería envejecida (eps_t = eps_0 + a*t), pérdidas menores (% o
+por accesorios K), diámetro óptimo y alternativas, CDT, potencia, NPSH y golpe de ariete (Joukowsky/Michaud).
 
-USO:
-    python booster_cdt.py                  # corre el ejemplo incluido
-    python booster_cdt.py mi_red.json      # usa tu propia configuración
-    python booster_cdt.py mi_red.json --plot
-
-Los valores por defecto (coeficientes, límites de presión y velocidad, rugosidades)
-son valores TÍPICOS de los Manuales MAPAS de CONAGUA. Verifícalos contra la
-edición vigente del manual y contra la norma de tu organismo operador.
-
-Unidades: longitudes en m, diámetros en mm (INTERNO), caudales en lps,
-          cargas y presiones en m.c.a., cotas en msnm.
+Unidades: m, mm, lps, m.c.a., msnm. Los valores por defecto son TÍPICOS (MAPAS / bibliografía): verifícalos
+contra la edición vigente del manual, la norma de tu organismo operador y los datos del fabricante.
 """
 from __future__ import annotations
 
-import json
+import copy
 import math
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-G = 9.81            # m/s2
-NU = 1.004e-6       # viscosidad cinemática del agua a 20 °C, m2/s
+G = 9.81
+NU = 1.004e-6
 HP_KW = 0.7457
+EV_KGCM2 = 2.06e4                   # módulo de compresibilidad del agua (MAPAS), kg/cm2
 
-# Valores típicos (verificar con MAPAS / proveedor de tubería)
-RUGOSIDAD_MM = {"PVC": 0.0015, "PEAD": 0.0015, "ACERO": 0.10, "FOFO": 0.25, "CONCRETO": 0.30}
-C_HAZEN = {"PVC": 150, "PEAD": 150, "ACERO": 120, "FOFO": 100, "CONCRETO": 120}
-MOTORES_HP = [1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250, 300]
+# ----------------------------------------------------------------------------- catálogos
+OD_IPS = {2: 60.3, 2.5: 73.0, 3: 88.9, 4: 114.3, 6: 168.3, 8: 219.1, 10: 273.1, 12: 323.9, 14: 355.6,
+          16: 406.4, 18: 457.2, 20: 508.0, 24: 609.6, 30: 762.0, 36: 914.4}       # DN (pulg) -> D ext (mm)
+OD_IPS = {float(k): v for k, v in OD_IPS.items()}
+DN_LISTA = sorted(OD_IPS)
+# clase -> (RD, presión de trabajo kg/cm2)
+RD_PVC = {"RD 41": (41, 7.0), "RD 32.5": (32.5, 8.8), "RD 26": (26, 11.2), "RD 21": (21, 14.1), "RD 13.5": (13.5, 28.1)}
+RD_PEAD = {"RD 26": (26, 6.4), "RD 21": (21, 8.2), "RD 17": (17, 10.2), "RD 13.6": (13.6, 12.7), "RD 11": (11, 16.3)}
+CLASES = {"PVC": RD_PVC, "PEAD": RD_PEAD, "ACERO": {"Estándar": (None, None)}, "FODU": {"K9": (None, None)}}
+# C: Hazen-Williams (nuevo) | eps0: rugosidad tubo nuevo (mm) | E: módulo de elasticidad (kg/cm2)
+MATERIALES = {
+    "PVC": {"C": 140, "eps0": 0.0015, "E": 2.81e4},
+    "PEAD": {"C": 140, "eps0": 0.0015, "E": 1.0e4},
+    "ACERO": {"C": 120, "eps0": 0.05, "E": 2.1e6},
+    "FODU": {"C": 140, "eps0": 0.12, "E": 1.7e6},
+}
+# coeficiente a (mm/año) por grupo de agua, ec. eps_t = eps_0 + a*t  (valores medios; ver Tabla 2.12 MAPAS)
+GRUPOS_AGUA = {
+    "I": ("Agua poco mineralizada, no corrosiva", 0.025),
+    "II": ("Agua poco mineralizada, algo corrosiva", 0.07),
+    "III": ("Agua con residuo mineral apreciable, moderadamente corrosiva", 0.20),
+    "IV": ("Agua dura, con tendencia a incrustar", 0.51),
+    "V": ("Agua muy dura, con residuo denso (a de 0.6 a más de 1)", 1.00),
+}
+ACCESORIOS_K = {   # valores típicos; editables en la app
+    "Codo 90° radio largo": 0.6, "Codo 90° radio corto": 0.9, "Codo 45°": 0.4, "Tee paso directo": 0.6,
+    "Tee salida lateral": 1.8, "Válvula compuerta abierta": 0.2, "Válvula mariposa abierta": 0.5,
+    "Válvula de esfera": 0.1, "Válvula de retención (check)": 2.5, "Reducción gradual": 0.15,
+    "Ampliación gradual": 0.30, "Entrada de borde vivo": 0.5, "Salida a tanque": 1.0, "Otro": 1.0,
+}
 
 
-# ----------------------------------------------------------------------------
-# 1. GASTOS DE DISEÑO
-# ----------------------------------------------------------------------------
-def calcula_gastos(poblacion: float, dotacion_lphd: float, cvd: float = 1.4, cvh: float = 1.55) -> dict:
-    """Gastos de diseño. cvd/cvh típicos MAPAS: 1.2-1.4 y 1.5-1.8 (según localidad)."""
-    qmed = poblacion * dotacion_lphd / 86400.0
-    qmd = qmed * cvd
-    qmh = qmd * cvh
-    return {"Qmed": qmed, "QMD": qmd, "QMH": qmh}
+def _nan(x):
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
-def gasto_bombeo(qmd_lps: float, horas_bombeo: float = 24.0) -> float:
-    """Con tanque regulador se bombea QMD distribuido en las horas de bombeo.
-    Si el booster alimenta directo a la red (sin tanque), la bomba debe dar QMH."""
-    return qmd_lps * 24.0 / horas_bombeo
+# ----------------------------------------------------------------------------- gastos
+def calcula_gastos(modo: str, poblacion=0.0, dotacion=0.0, qmed=0.0, qbomba=0.0, cvd=1.4, cvh=1.55,
+                   horas=24.0, con_tanque=True) -> dict:
+    """modo: 'poblacion' | 'qmed' | 'qbomba'. Con tanque regulador se bombea QMD*24/horas; directo a red, QMH."""
+    if modo == "qbomba":
+        return {"Qmed": None, "QMD": None, "QMH": None, "Qbomba": float(qbomba)}
+    if modo == "poblacion":
+        qmed = poblacion * dotacion / 86400.0
+    qmd, qmh = qmed * cvd, qmed * cvd * cvh
+    return {"Qmed": qmed, "QMD": qmd, "QMH": qmh, "Qbomba": qmd * 24.0 / horas if con_tanque else qmh}
 
 
-# ----------------------------------------------------------------------------
-# 2. HIDRÁULICA DE TUBERÍAS
-# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- geometría
+def geometria(material: str, dn: float, clase: str) -> dict:
+    mat, dn = material.upper(), float(dn)
+    if mat in ("PVC", "PEAD"):
+        if dn not in OD_IPS:
+            raise ValueError(f"DN {dn}\" no disponible en el catálogo de {mat}")
+        tab = CLASES[mat]
+        if clase not in tab:
+            raise ValueError(f"Clase '{clase}' inválida para {mat}: use {list(tab)}")
+        rd, p = tab[clase]
+        od = OD_IPS[dn]
+        e = od / rd
+        return {"D_int": od - 2 * e, "D_ext": od, "e": e, "P_m": p * 10.0}
+    d = dn * 25.4                                   # acero / hierro dúctil: DN ≈ diámetro interior
+    e = max(4.8, d / 60) if mat == "ACERO" else 9 * (0.5 + 0.001 * d)
+    return {"D_int": d, "D_ext": d + 2 * e, "e": e, "P_m": None}
+
+
+def prof_minima(d_ext_mm: float, dn_pulg: float, colchon_m: float) -> float:
+    """MAPAS: 0.70 m en tubería <= 51 mm; en adelante D_ext + 0.05 m + colchón mínimo."""
+    if dn_pulg * 25.4 <= 51.0:
+        return 0.70
+    return d_ext_mm / 1000.0 + 0.05 + colchon_m
+
+
+def ancho_zanja(d_ext_mm: float) -> float:
+    """MAPAS: D_ext + 0.50 m (D_ext < 0.50 m) o D_ext + 0.60 m (D_ext >= 0.50 m)."""
+    d = d_ext_mm / 1000.0
+    return d + (0.5 if d < 0.5 else 0.6)
+
+
 @dataclass
 class Nodo:
     id: str
-    cota: float
-    demanda_lps: float = 0.0            # gasto de diseño que sale en este nodo
-    p_req_m: Optional[float] = None     # presión deseada propia (si None usa la global)
+    cota: float                                     # cota de terreno, msnm
+    demanda_lps: float = 0.0                        # consumo fijo en el nodo (opcional)
+    p_req_m: Optional[float] = None                 # presión deseada propia (si None usa la global)
 
 
 @dataclass
@@ -77,134 +114,296 @@ class Tramo:
     id: str
     desde: str
     hasta: str
-    L: float                            # m
-    D_mm: float                         # diámetro interno, mm
+    L: float
+    dn_pulg: float
     material: str = "PVC"
-    K: float = 0.0                      # suma de coef. de pérdidas menores (codos, válvulas...)
-    perfil: Optional[list] = None       # perfil del terreno [(estación m, cota msnm), ...] (opcional)
+    clase: str = "RD 26"
+    prof_m: Optional[float] = None                  # profundidad de zanja (fondo); None = mínima MAPAS
+    K: float = 0.0                                  # K adicional manual
+    modo: str = "auto"                              # reparto: auto | pct | lps
+    valor: float = 0.0
+    perfil: Optional[list] = None                   # [(estación m, cota terreno)]
+    P_trab_kgcm2: Optional[float] = None
+    # derivados
+    D_mm: float = field(default=0.0, init=False)
+    D_ext: float = field(default=0.0, init=False)
+    e_mm: float = field(default=0.0, init=False)
+    P_clase_m: Optional[float] = field(default=None, init=False)
+    prof: float = field(default=0.0, init=False)
+    prof_min: float = field(default=0.0, init=False)
+    Ksum: float = field(default=0.0, init=False)
+    dz: float = field(default=0.0, init=False)
+    terreno: list = field(default_factory=list, init=False)
+    eje: list = field(default_factory=list, init=False)
 
 
-def perdida_tramo(t: Tramo, q_lps: float, metodo: str = "DW", pct_menores: float = 0.0):
-    """Devuelve (hf, hm, V). metodo: 'DW' Darcy-Weisbach (Swamee-Jain) o 'HW' Hazen-Williams."""
-    if q_lps <= 0 or t.L <= 0:
-        return 0.0, 0.0, (q_lps / 1000.0) / (math.pi * (t.D_mm / 1000.0) ** 2 / 4) if q_lps > 0 else 0.0
-    Q = q_lps / 1000.0
-    D = t.D_mm / 1000.0
-    V = Q / (math.pi * D ** 2 / 4.0)
-    mat = t.material.upper()
-    if metodo.upper() == "HW":
-        C = C_HAZEN.get(mat, 130)
-        hf = 10.67 * t.L * Q ** 1.852 / (C ** 1.852 * D ** 4.87)
-    else:
-        eps = RUGOSIDAD_MM.get(mat, 0.1) / 1000.0
-        Re = V * D / NU
-        if Re < 2000:
-            f = 64.0 / Re
-        else:
-            f = 0.25 / (math.log10(eps / (3.7 * D) + 5.74 / Re ** 0.9)) ** 2
-        hf = f * (t.L / D) * V ** 2 / (2 * G)
-    hm = t.K * V ** 2 / (2 * G) + pct_menores * hf
-    return hf, hm, V
+def prepara_tramo(t: Tramo, cfg: dict, ksum_acc: float = 0.0) -> None:
+    g = geometria(t.material, t.dn_pulg, t.clase)
+    t.D_mm, t.D_ext, t.e_mm = g["D_int"], g["D_ext"], g["e"]
+    t.P_clase_m = t.P_trab_kgcm2 * 10 if not _nan(t.P_trab_kgcm2) and t.P_trab_kgcm2 else g["P_m"]
+    t.prof_min = prof_minima(t.D_ext, t.dn_pulg, cfg.get("colchon_min_m", 0.90))
+    t.prof = float(t.prof_m) if not _nan(t.prof_m) else t.prof_min
+    t.dz = -t.prof + 0.05 + t.D_ext / 2000.0        # eje de tubería = fondo de zanja + cama 5 cm + radio exterior
+    t.Ksum = (0.0 if _nan(t.K) else t.K) + ksum_acc
 
 
-# ----------------------------------------------------------------------------
-# 3. RED RAMIFICADA (árbol con raíz en la descarga de la bomba)
-# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- red
 class Red:
-    def __init__(self, nodos: list[Nodo], tramos: list[Tramo], raiz: str):
+    def __init__(self, nodos, tramos, raiz, cfg):
         self.nodos = {n.id: n for n in nodos}
-        self.tramos = tramos
-        self.raiz = raiz
+        self.tramos, self.raiz, self.cfg = tramos, raiz, cfg
         self.hijos: dict[str, list[Tramo]] = {}
+        self.padre: dict[str, Tramo] = {}
+        acc: dict[str, float] = {}
+        for a in cfg.get("accesorios", []) or []:
+            acc[a["tramo"]] = acc.get(a["tramo"], 0.0) + float(a["cant"]) * float(a["K"])
         for t in tramos:
             for x in (t.desde, t.hasta):
                 if x not in self.nodos:
                     raise ValueError(f"Tramo {t.id}: el nodo '{x}' no existe.")
+            prepara_tramo(t, cfg, acc.get(t.id, 0.0))
             self.hijos.setdefault(t.desde, []).append(t)
+            self.padre[t.hasta] = t
         if raiz not in self.nodos:
             raise ValueError("La raíz (descarga de la bomba) no existe en los nodos.")
-        visto, pila = set(), [raiz]
+        vistos, pila = set(), [raiz]
         while pila:
             n = pila.pop()
-            if n in visto:
-                raise ValueError("La red tiene ciclos; este script resuelve redes RAMIFICADAS (árbol).")
-            visto.add(n)
+            if n in vistos:
+                raise ValueError("La red tiene ciclos; este programa resuelve redes ramificadas (árbol).")
+            vistos.add(n)
             pila += [t.hasta for t in self.hijos.get(n, [])]
-        faltan = set(self.nodos) - visto
-        if faltan:
-            raise ValueError(f"Nodos no conectados a la bomba: {sorted(faltan)}")
+        if set(self.nodos) - vistos:
+            raise ValueError(f"Nodos no conectados a la bomba: {sorted(set(self.nodos) - vistos)}")
+        for t in tramos:                            # perfiles de terreno y de eje de tubería, abscisa 0..L
+            if t.perfil and len(t.perfil) >= 2:
+                pf = sorted((float(x), float(z)) for x, z in t.perfil)
+                x0, span = pf[0][0], (pf[-1][0] - pf[0][0]) or 1.0
+                t.terreno = [((x - x0) / span * t.L, z) for x, z in pf]
+            else:
+                t.terreno = [(0.0, self.nodos[t.desde].cota), (t.L, self.nodos[t.hasta].cota)]
+            t.eje = [(x, z + t.dz) for x, z in t.terreno]
+        self.z_terr, self.z_tub = {}, {}
+        for t in tramos:
+            self.z_terr[t.hasta] = t.terreno[-1][1]
+            self.z_tub[t.hasta] = t.eje[-1][1]
+        h0 = self.hijos.get(raiz, [])
+        self.z_terr[raiz] = h0[0].terreno[0][1] if h0 else self.nodos[raiz].cota
+        self.z_tub[raiz] = h0[0].eje[0][1] if h0 else self.nodos[raiz].cota
 
-    def terminales(self) -> list[str]:
+    def terminales(self):
         return [n for n in self.nodos if n != self.raiz and not self.hijos.get(n)]
 
-    def caudales(self, k: float):
-        """Gasto por tramo (lps) con las demandas multiplicadas por k."""
-        q: dict[str, float] = {}
+    def camino(self, destino):
+        c, n = [], destino
+        while n != self.raiz:
+            c.insert(0, self.padre[n])
+            n = self.padre[n].desde
+        return c
 
-        def rec(nid: str) -> float:
-            tot = self.nodos[nid].demanda_lps * k
-            for t in self.hijos.get(nid, []):
-                qt = rec(t.hasta)
-                q[t.id] = qt
-                tot += qt
-            return tot
 
-        return q, rec(self.raiz)
+# ----------------------------------------------------------------------------- pérdidas
+def eps_tubo_mm(material: str, cfg: dict) -> float:
+    a = cfg.get("a_envejec_mm_anio")
+    if _nan(a):
+        a = GRUPOS_AGUA.get(cfg.get("grupo_agua", "II"), ("", 0.07))[1]
+    return MATERIALES.get(material.upper(), {"eps0": 0.1})["eps0"] + a * float(cfg.get("edad_anios", 0) or 0)
+
+
+def perdida_tramo(t, q_lps: float, cfg: dict):
+    """(hf, hm, V). Darcy-Weisbach/Swamee-Jain con eps_t (envejecida) o Hazen-Williams (solo tubería nueva)."""
+    D = t.D_mm / 1000.0
+    A = math.pi * D ** 2 / 4.0
+    if q_lps <= 0:
+        return 0.0, 0.0, 0.0
+    Q = q_lps / 1000.0
+    V = Q / A
+    edad = float(cfg.get("edad_anios", 0) or 0)
+    if cfg.get("metodo", "DW").upper() == "HW" and edad <= 0:
+        C = MATERIALES.get(t.material.upper(), {"C": 130})["C"]
+        hf = 10.67 * t.L * Q ** 1.852 / (C ** 1.852 * D ** 4.87)
+    else:
+        eps = eps_tubo_mm(t.material, cfg) / 1000.0
+        Re = V * D / NU
+        f = 64.0 / Re if Re < 2000 else 0.25 / (math.log10(eps / (3.7 * D) + 5.74 / Re ** 0.9)) ** 2
+        hf = f * (t.L / D) * V ** 2 / (2 * G)
+    if cfg.get("modo_menores", "pct") == "K":
+        hm = t.Ksum * V ** 2 / (2 * G)
+    else:
+        hm = cfg.get("pct_menores", 0.10) * hf
+    return hf, hm, V
+
+
+# ----------------------------------------------------------------------------- reparto de gasto
+class Hidraulica:
+    """Calcula el reparto de gasto por ramal (fijo / % / equilibrio hidráulico) y la carga requerida."""
+
+    def __init__(self, red: Red, cfg: dict):
+        self.red, self.cfg = red, cfg
+        self.pperf = cfg.get("presion_min_perfil_m", 0.0)
+
+    def perd(self, t, Q):
+        hf, hm, _ = perdida_tramo(t, Q, self.cfg)
+        return hf + hm
+
+    def p_req(self, n):
+        p = self.red.nodos[n].p_req_m
+        return self.cfg["presion_deseada_m"] if _nan(p) else p
+
+    def H_up(self, t, Q):
+        """Carga requerida aguas arriba del tramo para pasar Q (incluye puntos altos del perfil)."""
+        perd = self.perd(t, Q)
+        h = self.H_req(t.hasta, Q) + perd
+        for x, z in t.eje:
+            h = max(h, z + self.pperf + (perd * x / t.L if t.L > 0 else 0.0))
+        return h
+
+    def H_req(self, n, Q):
+        if not self.red.hijos.get(n):
+            return self.red.z_tub[n] + self.p_req(n)
+        return self.reparto(n, Q)[1]
+
+    def Q_de_H(self, t, H, Qmax):
+        if Qmax <= 0 or self.H_up(t, 0.0) >= H:
+            return 0.0
+        if self.H_up(t, Qmax) <= H:
+            return Qmax
+        lo, hi = 0.0, Qmax
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if self.H_up(t, mid) < H else (lo, mid)
+        return (lo + hi) / 2
+
+    def reparto(self, n, Q):
+        red = self.red
+        nodo = red.nodos[n]
+        d = 0.0 if _nan(nodo.demanda_lps) else nodo.demanda_lps
+        Qout = max(Q - d, 0.0)
+        hs = red.hijos[n]
+        q, autos, Hn = {}, [], -1e9
+        for t in hs:
+            if t.modo == "lps":
+                q[t.id] = max(float(t.valor), 0.0)
+            elif t.modo == "pct":
+                q[t.id] = Qout * float(t.valor) / 100.0
+            else:
+                autos.append(t)
+        for t in hs:
+            if t.id in q:
+                Hn = max(Hn, self.H_up(t, q[t.id]))
+        Qr = max(Qout - sum(q.values()), 0.0)
+        if autos:
+            if len(autos) == 1:
+                q[autos[0].id] = Qr
+                Ha = self.H_up(autos[0], Qr)
+            else:
+                lo = min(self.H_up(t, 0.0) for t in autos)
+                hi = max(self.H_up(t, Qr) for t in autos) + 1e-6
+                for _ in range(40):
+                    mid = (lo + hi) / 2
+                    s = sum(self.Q_de_H(t, mid, Qr) for t in autos)
+                    lo, hi = (mid, hi) if s < Qr else (lo, mid)
+                Ha = (lo + hi) / 2
+                qa = {t.id: self.Q_de_H(t, Ha, Qr) for t in autos}
+                tot = sum(qa.values()) or 1.0
+                q.update({k: v * Qr / tot for k, v in qa.items()})
+            Hn = max(Hn, Ha)
+        if d > 0:
+            Hn = max(Hn, red.z_tub[n] + self.p_req(n))
+        return q, Hn
+
+    def asigna(self, Qtot):
+        flows = {}
+
+        def rec(n, Q):
+            if not self.red.hijos.get(n):
+                return
+            q, _ = self.reparto(n, Q)
+            for t in self.red.hijos[n]:
+                flows[t.id] = q[t.id]
+                rec(t.hasta, q[t.id])
+
+        rec(self.red.raiz, Qtot)
+        return flows
 
 
 def resolver(red: Red, k: float, cfg: dict) -> dict:
-    """Con demandas escaladas por k, obtiene la carga requerida en la descarga de la bomba
-    para garantizar la presión deseada en el/los nodos de control."""
-    q, qtot = red.caudales(k)
-    acum = {red.raiz: 0.0}
-    det = {}
-    pila = [red.raiz]
+    hid = Hidraulica(red, cfg)
+    Qtot = cfg["Q_bombeo_lps"] * k
+    q = hid.asigna(Qtot) if Qtot > 0 else {t.id: 0.0 for t in red.tramos}
+    acum, det, pila = {red.raiz: 0.0}, {}, [red.raiz]
     while pila:
         n = pila.pop()
         for t in red.hijos.get(n, []):
-            hf, hm, v = perdida_tramo(t, q[t.id], cfg["metodo"], cfg["pct_menores"])
+            hf, hm, v = perdida_tramo(t, q[t.id], cfg)
             det[t.id] = {"Q": q[t.id], "V": v, "hf": hf, "hm": hm}
             acum[t.hasta] = acum[n] + hf + hm
             pila.append(t.hasta)
-    controles = cfg.get("nodos_control") or red.terminales()
     req = {}
-    for nid in controles:
-        nd = red.nodos[nid]
-        p = nd.p_req_m if nd.p_req_m is not None else cfg["presion_deseada_m"]
-        req[nid] = nd.cota + p + acum[nid]
-    # Perfil del terreno (opcional): la línea piezométrica debe quedar sobre CADA punto del perfil
-    p_perfil = cfg.get("presion_min_perfil_m", 0.0)
+    for nid, nd in red.nodos.items():
+        if nid == red.raiz:
+            continue
+        if not red.hijos.get(nid) or (not _nan(nd.demanda_lps) and nd.demanda_lps > 0):
+            req[nid] = red.z_tub[nid] + hid.p_req(nid) + acum[nid]
     for t in red.tramos:
-        if t.perfil and len(t.perfil) >= 2:
-            pf = sorted(tuple(p) for p in t.perfil)
-            x0, span = pf[0][0], (pf[-1][0] - pf[0][0]) or 1.0
-            perd = det[t.id]["hf"] + det[t.id]["hm"]
-            for x, z in pf:                          # pérdida repartida uniformemente a lo largo del tramo
-                req[f"{t.id}@{x:.0f}m"] = z + p_perfil + acum[t.desde] + perd * (x - x0) / span
+        d = det[t.id]
+        for x, z in t.eje:
+            req[f"{t.id}@{x:.0f}m"] = z + hid.pperf + acum[t.desde] + (d["hf"] + d["hm"]) * x / (t.L or 1.0)
     crit = max(req, key=req.get)
-    H = req[crit]                                   # cota piezométrica requerida en la descarga
-    pres = {n: H - acum[n] - red.nodos[n].cota for n in acum}
-    return {"k": k, "Q": qtot, "H_desc": H, "crit": crit, "det": det, "pres": pres, "acum": acum, "req": req}
+    H = req[crit]
+    hgl = {red.raiz: H}
+    for nid in acum:
+        hgl[nid] = H - acum[nid]
+    pres = {n: hgl[n] - red.z_tub[n] for n in acum}
+    for t in red.tramos:
+        d = det[t.id]
+        pm = min(hgl[t.desde] - (d["hf"] + d["hm"]) * x / (t.L or 1.0) - z for x, z in t.eje)
+        d["p_min_linea"] = pm
+    return {"k": k, "Q": Qtot, "H_desc": H, "crit": crit, "det": det, "pres": pres, "acum": acum,
+            "req": req, "hgl": hgl}
 
 
-# ----------------------------------------------------------------------------
-# 4. SUCCIÓN, NPSH, POTENCIA, CURVA DE BOMBA
-# ----------------------------------------------------------------------------
-def patm_m(altitud_m: float) -> float:
-    return 10.33 * (1 - 2.25577e-5 * altitud_m) ** 5.25588
+def analizar(cfg: dict) -> dict:
+    nodos = [Nodo(**n) for n in cfg["nodos"]]
+    tramos = [Tramo(**t) for t in cfg["tramos"]]
+    red = Red(nodos, tramos, cfg["raiz"], cfg)
+    s = cfg["succion"]
+    ts = Tramo("succion", "tanque", "bomba", s.get("L", 0.0), s["dn_pulg"], s.get("material", "PVC"),
+               s.get("clase", "RD 26"), None, s.get("K", 0.0))
+    ksuc = sum(float(a["cant"]) * float(a["K"]) for a in cfg.get("accesorios", []) or [] if a["tramo"] == "succion")
+    prepara_tramo(ts, cfg, ksuc)
+    avisos = []
+    if cfg.get("metodo", "DW").upper() == "HW" and (cfg.get("edad_anios", 0) or 0) > 0:
+        avisos.append("Con tubería envejecida se usa Darcy-Weisbach (eps_t = eps_0 + a·t); Hazen-Williams solo aplica a tubería nueva.")
+    esc = []
+    for k in cfg["escenarios"]:
+        r = resolver(red, k, cfg)
+        hf, hm, vs = perdida_tramo(ts, r["Q"], cfg)
+        r["hf_succ"], r["V_succ"] = hf + hm, vs
+        r["H_succ"] = s["nivel_agua"] - r["hf_succ"]
+        r["CDT"] = r["H_desc"] - r["H_succ"]
+        esc.append(r)
+    c0 = {**cfg, "edad_anios": 0}
+    nueva = resolver(red, 1.0, c0)
+    hfn, hmn, _ = perdida_tramo(ts, nueva["Q"], c0)
+    nueva["CDT"] = nueva["H_desc"] - (s["nivel_agua"] - hfn - hmn)
+    return {"red": red, "esc": esc, "nueva": nueva, "tsuc": ts, "avisos": avisos}
 
 
-def pvap_m(temp_c: float) -> float:
-    mmhg = 10 ** (8.07131 - 1730.63 / (233.426 + temp_c))
-    return mmhg * 0.013595
+# ----------------------------------------------------------------------------- equipo, curva de bomba
+def patm_m(alt):
+    return 10.33 * (1 - 2.25577e-5 * alt) ** 5.25588
 
 
-def ajusta_curva(puntos):
-    """Ajusta H = c0 + c1*Q + c2*Q^2 a 3 puntos (Q lps, H m) de UNA bomba a velocidad nominal."""
-    pts = [tuple(p) for p in puntos[:3]]
+def pvap_m(T):
+    return 10 ** (8.07131 - 1730.63 / (233.426 + T)) * 0.013595
+
+
+def ajusta_curva(pts):
+    p = [tuple(x) for x in pts[:3]]
     c0 = c1 = c2 = 0.0
-    for i, (xi, yi) in enumerate(pts):
-        xj, xk = [p[0] for j, p in enumerate(pts) if j != i]
+    for i, (xi, yi) in enumerate(p):
+        xj, xk = [q[0] for j, q in enumerate(p) if j != i]
         den = (xi - xj) * (xi - xk)
         c2 += yi / den
         c1 += -yi * (xj + xk) / den
@@ -212,213 +411,190 @@ def ajusta_curva(puntos):
     return c0, c1, c2
 
 
-def velocidad_relativa(coefs, q_bomba, h_req):
-    """Relación de velocidad r (n/n_nominal) para que una bomba entregue (Q,H). Leyes de afinidad."""
+def velocidad_relativa(coefs, q, h):
     a, b, c = coefs
-    disc = (b * q_bomba) ** 2 - 4 * a * (c * q_bomba ** 2 - h_req)
-    if disc < 0 or a <= 0:
-        return None
-    return (-b * q_bomba + math.sqrt(disc)) / (2 * a)
+    disc = (b * q) ** 2 - 4 * a * (c * q ** 2 - h)
+    return None if disc < 0 or a <= 0 else (-b * q + math.sqrt(disc)) / (2 * a)
 
 
-def motor_comercial(hp: float) -> float:
-    for m in MOTORES_HP:
-        if m >= hp:
-            return m
-    return math.ceil(hp)
+MOTORES_HP = [1, 1.5, 2, 3, 5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100, 125, 150, 200, 250, 300]
 
 
-# ----------------------------------------------------------------------------
-# 5. ANÁLISIS COMPLETO
-# ----------------------------------------------------------------------------
-def construir_red(cfg: dict) -> Red:
-    nodos = [Nodo(**n) for n in cfg["nodos"]]
-    tramos = [Tramo(**t) for t in cfg["tramos"]]
-    return Red(nodos, tramos, cfg["raiz"])
+def motor_comercial(hp):
+    return next((m for m in MOTORES_HP if m >= hp), math.ceil(hp))
 
 
-def analizar(cfg: dict) -> dict:
-    red = construir_red(cfg)
-    s = cfg["succion"]
-    tsuc = Tramo("succion", "tanque", "bomba", s.get("L", 0), s["D_mm"], s.get("material", "PVC"), s.get("K", 0))
-    escenarios = []
-    for k in cfg["escenarios"]:
-        r = resolver(red, k, cfg)
-        hf, hm, vs = perdida_tramo(tsuc, r["Q"], cfg["metodo"], cfg["pct_menores"])
-        r["hf_succ"], r["V_succ"] = hf + hm, vs
-        r["H_succ"] = s["nivel_agua"] - r["hf_succ"]       # cota piezométrica a la entrada de la bomba
-        r["CDT"] = r["H_desc"] - r["H_succ"]
-        escenarios.append(r)
-    return {"red": red, "esc": escenarios, "tsuc": tsuc}
+def diseno(res):
+    return max(res["esc"], key=lambda r: r["k"])
 
 
-def reporte(cfg: dict, res: dict) -> None:
-    red, esc = res["red"], res["esc"]
-    dis = max(esc, key=lambda r: r["k"])             # escenario de diseño = mayor k
-    nb = cfg.get("n_bombas", 1)
-    lim = cfg["limites"]
-    linea = "=" * 78
+def equipo(cfg, res):
+    dis, nb, s = diseno(res), cfg.get("n_bombas", 1), cfg["succion"]
+    Q, H = dis["Q"], dis["CDT"]
+    p_hid = G * Q / 1000 * H
+    p_kw = p_hid / (cfg["eficiencia_bomba"] * cfg["eficiencia_motor"])
+    hp = p_kw / HP_KW
+    npshd = patm_m(s["altitud_m"]) - pvap_m(s.get("temp_c", 20)) + (s["nivel_agua"] - s["cota_eje_bomba"]) - dis["hf_succ"]
+    npshr = cfg.get("npsh_requerido")
+    return {"Q": Q, "H": H, "p_hid": p_hid, "p_kw": p_kw, "hp": hp,
+            "hp_com": motor_comercial(hp * cfg["factor_seguridad_motor"] / nb), "npshd": npshd,
+            "marg": (npshd - npshr) if npshr else None, "crit": dis["crit"]}
 
-    print(linea)
-    print(" BOOSTER CON PRESIÓN CONSTANTE - MEMORIA DE CÁLCULO")
-    print(linea)
-    print(f" Método: {'Darcy-Weisbach (Swamee-Jain)' if cfg['metodo'].upper() == 'DW' else 'Hazen-Williams'}"
-          f" | menores: {cfg['pct_menores'] * 100:.0f}% de hf + K | bombas en paralelo: {nb}")
-    print(f" Presión deseada en nodos de control: {cfg['presion_deseada_m']} m.c.a.")
 
-    print("\n--- Tramos en condición de diseño ---")
-    print(f" {'Tramo':<10}{'Q lps':>8}{'D mm':>8}{'L m':>10}{'V m/s':>8}{'hf m':>8}{'hm m':>8}  Obs")
+# ----------------------------------------------------------------------------- golpe de ariete
+def celeridad(t) -> float:
+    """Allievi (MAPAS): a = 1420 / sqrt(1 + (Ev/E)(D/e))  [m/s]."""
+    E = MATERIALES.get(t.material.upper(), {"E": 2.0e6})["E"]
+    return 1420.0 / math.sqrt(1.0 + (EV_KGCM2 / E) * (t.D_mm / t.e_mm))
+
+
+def ariete(cfg, res):
+    """Estimación por tramo para paro de bomba / cierre: Joukowsky (tc <= 2L/a) o Michaud (tc > 2L/a)."""
+    red, dis, s = res["red"], diseno(res), cfg["succion"]
+    tc = float(cfg.get("tc_s", 0.0) or 0.0)
+    filas = []
     for t in red.tramos:
         d = dis["det"][t.id]
-        obs = ""
-        if d["Q"] > 0 and d["V"] < lim["v_min"]:
-            obs = "V baja"
-        if d["V"] > lim["v_max"]:
-            obs = "V ALTA"
-        print(f" {t.id:<10}{d['Q']:>8.2f}{t.D_mm:>8.1f}{t.L:>10.2f}{d['V']:>8.2f}{d['hf']:>8.2f}{d['hm']:>8.2f}  {obs}")
-
-    print("\n--- Presiones en nodos (condición de diseño, sin válvulas reguladoras) ---")
-    print(f" {'Nodo':<10}{'Cota':>9}{'P m.c.a.':>10}{'P kg/cm2':>10}  Obs")
-    for nid, p in dis["pres"].items():
-        obs = ""
-        if nid != red.raiz:
-            if p < lim["p_min"] - 1e-6:
-                obs = "BAJA"
-            elif p > lim["p_max"]:
-                obs = f"ALTA: instalar VRP/válvula, disipar ~{p - cfg['presion_deseada_m']:.1f} m"
-            elif nid in red.terminales() and p - cfg["presion_deseada_m"] > 1.0:
-                obs = f"exceso {p - cfg['presion_deseada_m']:.1f} m (regular el ramal)"
-        print(f" {nid:<10}{red.nodos[nid].cota:>9.2f}{p:>10.2f}{p / 10:>10.2f}  {obs}")
-
-    print(f"\n Nodo crítico (define la carga): {dis['crit']}")
-
-    print("\n--- Curva del sistema a presión constante ---")
-    coefs = ajusta_curva(cfg["curva_bomba"]) if cfg.get("curva_bomba") else None
-    enc = f" {'Q lps':>8}{'Q/bomba':>9}{'CDT m':>9}{'P descarga':>12}{'Crítico':>10}"
-    if coefs:
-        enc += f"{'N/Nnom':>9}"
-    print(enc)
-    for r in esc:
-        p_desc = r["H_desc"] - red.nodos[red.raiz].cota
-        linea_r = f" {r['Q']:>8.2f}{r['Q'] / nb:>9.2f}{r['CDT']:>9.2f}{p_desc:>12.2f}{r['crit']:>10}"
-        if coefs:
-            rr = velocidad_relativa(coefs, r["Q"] / nb, r["CDT"]) if r["Q"] > 0 else None
-            linea_r += f"{rr * 100:>8.0f}%" if rr else f"{'n/d':>9}"
-        print(linea_r)
-    print(" P descarga = consigna de presión en la descarga para sostener la presión deseada en el nodo")
-    print(" crítico. Si el sensor del VFD está en la descarga, la consigna debe COMPENSARSE con el gasto")
-    print(" (aumentar al subir Q). Si el sensor está en el nodo crítico, la consigna es fija.")
-
-    # Potencia y NPSH en el punto de diseño
-    Q = dis["Q"]
-    H = dis["CDT"]
-    eta_b, eta_m, fs = cfg["eficiencia_bomba"], cfg["eficiencia_motor"], cfg["factor_seguridad_motor"]
-    p_hid = G * (Q / 1000.0) * H                        # kW
-    p_motor_kw = p_hid / (eta_b * eta_m)
-    hp_req = p_motor_kw / HP_KW
-    hp_com = motor_comercial(hp_req * fs / nb)
-    s = cfg["succion"]
-    npshd = (patm_m(s["altitud_m"]) - pvap_m(s.get("temp_c", 20)) + (s["nivel_agua"] - s["cota_eje_bomba"]) - dis["hf_succ"])
-    print("\n--- Equipo de bombeo (punto de diseño) ---")
-    print(f" Capacidad total .............. {Q:.2f} lps  ({Q / nb:.2f} lps por bomba, {nb} en paralelo)")
-    print(f" CDT de diseño ................ {H:.2f} m.c.a.  (estática+fricción+menores+presión residual)")
-    print(f" Potencia hidráulica .......... {p_hid:.2f} kW")
-    print(f" Potencia al motor ............ {p_motor_kw:.2f} kW = {hp_req:.1f} HP (η bomba {eta_b:.0%}, η motor {eta_m:.0%})")
-    print(f" Motor comercial sugerido ..... {hp_com:g} HP por bomba (F.S. {fs:.2f})")
-    print(f" NPSH disponible .............. {npshd:.2f} m (Patm {patm_m(s['altitud_m']):.2f} m a {s['altitud_m']:.0f} msnm)")
-    if cfg.get("npsh_requerido"):
-        marg = npshd - cfg["npsh_requerido"]
-        print(f" NPSH requerido (fabricante) .. {cfg['npsh_requerido']:.2f} m -> margen {marg:.2f} m "
-              f"{'OK' if marg >= 1.0 else 'INSUFICIENTE (recomendado >= 1 m)'}")
-    else:
-        print(" NPSH requerido ............... captura el del fabricante y compara (margen >= 1 m).")
-    print(linea)
-    print(" Verificar: perfil real del terreno (puntos altos), golpe de ariete, válvulas de aire,")
-    print(" curva del fabricante y operación a gasto mínimo (bomba piloto / jockey).")
-    print(linea)
+        V = d["V"]
+        a = celeridad(t)
+        T = 2 * t.L / a
+        dH = a * V / G
+        tipo = "directo (Joukowsky)"
+        if tc > T and V > 0:
+            dH = min(2 * t.L * V / (G * tc), dH)
+            tipo = "indirecto (Michaud)"
+        p_op = max(dis["pres"][t.desde], dis["pres"][t.hasta])
+        p_est = max(s["nivel_agua"] - red.z_tub[t.desde], s["nivel_agua"] - red.z_tub[t.hasta])
+        p_max = max(p_op, p_est) + dH
+        p_min = d["p_min_linea"] - dH
+        obs = []
+        if t.P_clase_m and p_max > t.P_clase_m:
+            obs.append(f"EXCEDE clase ({t.P_clase_m:.0f} m)")
+        if p_min <= -10:
+            obs.append("vacío / separación de columna")
+        elif p_min < 0:
+            obs.append("depresión")
+        filas.append({"Tramo": t.id, "V m/s": V, "a m/s": a, "T=2L/a s": T, "Tipo": tipo, "ΔH m": dH,
+                      "P op. máx m": max(p_op, p_est), "P máx. m": p_max, "P mín. m": p_min,
+                      "Clase m": t.P_clase_m, "Obs": "; ".join(obs)})
+    return filas
 
 
-def graficar(cfg: dict, res: dict) -> None:
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib no instalado: pip install matplotlib")
-        return
-    esc = res["esc"]
-    qs = [r["Q"] for r in esc]
-    hs = [r["CDT"] for r in esc]
-    plt.figure(figsize=(7, 4.5))
-    plt.plot(qs, hs, "o-", label="Sistema (presión constante)")
-    if cfg.get("curva_bomba"):
-        nb = cfg.get("n_bombas", 1)
-        c0, c1, c2 = ajusta_curva(cfg["curva_bomba"])
-        qmax = max(qs) * 1.3
-        xs = [qmax * i / 50 for i in range(51)]
-        plt.plot(xs, [c0 + c1 * x / nb + c2 * (x / nb) ** 2 for x in xs], "--", label=f"Bomba 100% ({nb} en paralelo)")
-    plt.xlabel("Q (lps)")
-    plt.ylabel("CDT (m.c.a.)")
-    plt.grid(alpha=.3)
-    plt.legend()
-    plt.title("Curva del sistema booster")
-    plt.tight_layout()
-    plt.savefig("curva_sistema.png", dpi=150)
-    print("Gráfica guardada: curva_sistema.png")
+# ----------------------------------------------------------------------------- diámetros
+def dn_optimo(Q_lps, material, clase, cfg):
+    """Diámetro óptimo (criterio en cfg['criterio_dn']):
+    'bresse'    : D = 1.3 X^0.25 sqrt(Q), X = horas/24; DN comercial más cercano (por diámetro interior)
+    'velocidad' : menor DN con V <= v_obj
+    'gradiente' : menor DN con pérdida unitaria J <= J_max (m/km), Hazen-Williams con C del material"""
+    if Q_lps is None or Q_lps <= 0:
+        return None
+    crit = cfg.get("criterio_dn", "bresse")
+    if crit == "bresse":
+        X = cfg.get("horas_bombeo", 24.0) / 24.0
+        Db = 1.3 * X ** 0.25 * math.sqrt(Q_lps / 1000.0) * 1000
+        return min(DN_LISTA, key=lambda dn: abs(geometria(material, dn, clase)["D_int"] - Db))
+    C = MATERIALES.get(material.upper(), {"C": 130})["C"]
+    for dn in DN_LISTA:
+        D = geometria(material, dn, clase)["D_int"] / 1000
+        if crit == "gradiente":
+            J = 10.67 * (Q_lps / 1000) ** 1.852 / (C ** 1.852 * D ** 4.87) * 1000
+            if J <= cfg.get("J_max_m_km", 4.0):
+                return dn
+        elif (Q_lps / 1000) / (math.pi * D ** 2 / 4) <= cfg.get("v_obj", 1.5):
+            return dn
+    return DN_LISTA[-1]
 
 
-# ----------------------------------------------------------------------------
-# 6. CONFIGURACIÓN (EJEMPLO = esquema en T del problema anterior)
-# ----------------------------------------------------------------------------
+def _rapido(cfg):
+    c = copy.deepcopy(cfg)
+    c["escenarios"] = [1.0]
+    return c
+
+
+def optimiza_diametros(cfg):
+    """Con los gastos ya definidos (los del reparto actual, congelados) asigna a cada tramo su DN óptimo."""
+    c = copy.deepcopy(cfg)
+    dis = diseno(analizar(_rapido(c)))
+    for t in c["tramos"]:
+        dn = dn_optimo(dis["det"][t["id"]]["Q"], t.get("material", "PVC"), t.get("clase", "RD 26"), c)
+        if dn is not None:
+            t["dn_pulg"] = dn
+    return c
+
+
+def alternativas(cfg, tramo_id):
+    """Para un tramo: DN óptimo -1, óptimo, óptimo +1 y el actual; efecto en CDT, potencia, V y ariete."""
+    base = _rapido(cfg)
+    res0 = analizar(base)
+    Q = diseno(res0)["det"][tramo_id]["Q"]
+    t0 = next(t for t in base["tramos"] if t["id"] == tramo_id)
+    opt = dn_optimo(Q, t0.get("material", "PVC"), t0.get("clase", "RD 26"), base) or t0["dn_pulg"]
+    i = DN_LISTA.index(opt)
+    cand = [DN_LISTA[j] for j in (i - 1, i, i + 1) if 0 <= j < len(DN_LISTA)]
+    if t0["dn_pulg"] not in cand:
+        cand.append(t0["dn_pulg"])
+    eq0 = equipo(base, res0)
+    filas = []
+    for dn in sorted(cand):
+        c = copy.deepcopy(base)
+        next(t for t in c["tramos"] if t["id"] == tramo_id)["dn_pulg"] = dn
+        r = analizar(c)
+        eq, d, ar = equipo(c, r), diseno(r)["det"][tramo_id], ariete(c, r)
+        fa = next(x for x in ar if x["Tramo"] == tramo_id)
+        tr = next(t for t in r["red"].tramos if t.id == tramo_id)
+        obs = "" if cfg["limites"]["v_min"] <= d["V"] <= cfg["limites"]["v_max"] else "V fuera de límites"
+        filas.append({"DN pulg": dn, "D int mm": tr.D_mm, "V m/s": d["V"], "hf+hm tramo m": d["hf"] + d["hm"],
+                      "CDT m": eq["H"], "ΔCDT m": eq["H"] - eq0["H"], "Potencia HP": eq["hp"],
+                      "ΔHP": eq["hp"] - eq0["hp"], "ΔH ariete m": fa["ΔH m"],
+                      "Etiqueta": ("óptimo" if dn == opt else "") + (" · actual" if dn == t0["dn_pulg"] else ""),
+                      "Obs": obs})
+    return {"Q": Q, "optimo": opt, "actual": t0["dn_pulg"], "filas": filas}
+
+
+def advertencia_cambio(alt):
+    """Texto de advertencia al comparar el DN actual contra el óptimo."""
+    act = next(f for f in alt["filas"] if f["DN pulg"] == alt["actual"])
+    opt = next(f for f in alt["filas"] if f["DN pulg"] == alt["optimo"])
+    if alt["actual"] == alt["optimo"]:
+        return "El diámetro actual coincide con el óptimo para el gasto de diseño."
+    dcdt, dhp = act["CDT m"] - opt["CDT m"], act["Potencia HP"] - opt["Potencia HP"]
+    if alt["actual"] < alt["optimo"]:
+        return (f"Con {alt['actual']}\" (menor que el óptimo {alt['optimo']}\"): V = {act['V m/s']:.2f} m/s, CDT {dcdt:+.1f} m "
+                f"y potencia {dhp:+.1f} HP respecto al óptimo (más energía todo el año), ΔH de ariete "
+                f"{act['ΔH ariete m'] - opt['ΔH ariete m']:+.1f} m. Ventaja: tubería más barata. Riesgos: mayor presión en la bomba, "
+                "mayores pérdidas y desgaste, velocidad alta si supera el límite, y menor holgura para ampliaciones o tubería envejecida.")
+    return (f"Con {alt['actual']}\" (mayor que el óptimo {alt['optimo']}\"): V = {act['V m/s']:.2f} m/s, CDT {dcdt:+.1f} m y potencia "
+            f"{dhp:+.1f} HP respecto al óptimo (menos energía). Ventaja: menos pérdidas y margen a futuro. Riesgos: mayor costo de tubería y "
+            "excavación, y velocidad baja (< límite mínimo) con riesgo de sedimentación y mayor tiempo de residencia del agua.")
+
+
+# ----------------------------------------------------------------------------- configuración de ejemplo
 DEFAULTS = {
-    "metodo": "DW",                     # "DW" Darcy-Weisbach  |  "HW" Hazen-Williams
-    "pct_menores": 0.10,                # pérdidas menores como % de la fricción
-    "presion_deseada_m": 15.0,          # presión constante deseada en nodos de control (m.c.a.)
-    "nodos_control": None,              # None = todos los nodos terminales; o lista ["Pte","Ote"]
-    "escenarios": [0.0, 0.25, 0.5, 0.75, 1.0],      # fracciones del gasto de diseño
-    "n_bombas": 1,
-    "eficiencia_bomba": 0.65,
-    "eficiencia_motor": 0.92,
-    "factor_seguridad_motor": 1.15,
-    "npsh_requerido": None,             # m, del fabricante
-    "curva_bomba": None,                # 3 puntos [(Q lps, H m)] de UNA bomba a velocidad nominal
-    "limites": {"p_min": 10.0, "p_max": 50.0, "v_min": 0.3, "v_max": 5.0},   # típicos MAPAS
+    "metodo": "DW", "edad_anios": 0, "grupo_agua": "II", "a_envejec_mm_anio": None,
+    "modo_menores": "pct", "pct_menores": 0.10, "accesorios": [], "colchon_min_m": 0.90,
+    "presion_deseada_m": 15.0, "presion_min_perfil_m": 0.0, "escenarios": [0.0, 0.25, 0.5, 0.75, 1.0],
+    "n_bombas": 1, "eficiencia_bomba": 0.65, "eficiencia_motor": 0.92, "factor_seguridad_motor": 1.15,
+    "npsh_requerido": None, "curva_bomba": None, "tc_s": 0.0, "criterio_dn": "bresse", "v_obj": 1.5, "J_max_m_km": 4.0,
+    "horas_bombeo": 24.0, "limites": {"p_min": 10.0, "p_max": 50.0, "v_min": 0.3, "v_max": 5.0},
 }
-
 EJEMPLO = {
-    "raiz": "B",                        # descarga de la bomba
-    "nodos": [
-        {"id": "B", "cota": 290.41},
-        {"id": "T", "cota": 290.96},
-        {"id": "Pte", "cota": 303.00, "demanda_lps": 12.0},
-        {"id": "Ote", "cota": 279.65, "demanda_lps": 6.0},
-    ],
+    "raiz": "B", "Q_bombeo_lps": 18.0,
+    "nodos": [{"id": "B", "cota": 290.41}, {"id": "T", "cota": 290.96},
+              {"id": "Pte", "cota": 303.00}, {"id": "Ote", "cota": 279.65}],
     "tramos": [
-        {"id": "B-T", "desde": "B", "hasta": "T", "L": 42.0, "D_mm": 152.4},
-        {"id": "T-Pte", "desde": "T", "hasta": "Pte", "L": 3474.55, "D_mm": 152.4},
-        {"id": "T-Ote", "desde": "T", "hasta": "Ote", "L": 2007.40, "D_mm": 101.6},
-    ],
-    "succion": {"nivel_agua": 291.33, "cota_eje_bomba": 290.41, "L": 6.0, "D_mm": 203.2,
-                "K": 1.5, "altitud_m": 2240, "temp_c": 20},
-    "presion_deseada_m": 15.0,
+        {"id": "B-T", "desde": "B", "hasta": "T", "L": 42.0, "dn_pulg": 6},
+        {"id": "T-Pte", "desde": "T", "hasta": "Pte", "L": 3474.55, "dn_pulg": 6, "modo": "lps", "valor": 12},
+        {"id": "T-Ote", "desde": "T", "hasta": "Ote", "L": 2007.40, "dn_pulg": 4, "modo": "lps", "valor": 6}],
+    "succion": {"nivel_agua": 291.33, "cota_eje_bomba": 290.41, "L": 6.0, "dn_pulg": 8, "altitud_m": 2240, "temp_c": 20},
 }
 
 
-def main() -> None:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    cfg = dict(DEFAULTS)
-    if args:
-        with open(args[0], encoding="utf-8") as f:
-            user = json.load(f)
-    else:
-        user = EJEMPLO
-        print("(Sin archivo JSON: se usa el ejemplo incluido, esquema en T)\n")
-    cfg.update(user)
-    cfg["limites"] = {**DEFAULTS["limites"], **user.get("limites", {})}
+def main():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg.update(copy.deepcopy(EJEMPLO))
     res = analizar(cfg)
-    reporte(cfg, res)
-    if "--plot" in sys.argv:
-        graficar(cfg, res)
+    eq = equipo(cfg, res)
+    print(f"Q={eq['Q']:.1f} lps  CDT={eq['H']:.2f} m  Potencia={eq['hp']:.1f} HP  crítico={eq['crit']}")
 
 
 if __name__ == "__main__":
