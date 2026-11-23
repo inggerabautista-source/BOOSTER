@@ -94,12 +94,23 @@ def tablas(cfg, res, con_alternativas=False):
         ("Presión deseada", f"{cfg['presion_deseada_m']} m.c.a."),
         ("Tiempo de paro/cierre (ariete)", f"{cfg.get('tc_s', 0)} s"),
     ]
+    vn, vt, ok_global = bc.verifica_presiones(cfg, res)
+    filas.append(("Verificación de presiones", "CUMPLE" if ok_global else "NO CUMPLE"))
+    filas.append(("Presión de suministro (proyecto)",
+                  f"mín. {lim['p_min'] / 10:.2f} / máx. {lim['p_max'] / 10:.2f} kg/cm²"))
     perf = [{"Tramo": t.id, "Estación m": x, "Cota": z} for t in red.tramos if t.perfil for x, z in t.terreno]
     acc = pd.DataFrame(cfg.get("accesorios") or [], columns=["tramo", "tipo", "cant", "K"])
     out = {"Resumen": pd.DataFrame(filas, columns=["Concepto", "Valor"]), "Tramos": pd.DataFrame(tr),
            "Nodos": pd.DataFrame(nd), "Zanja y cotas": pd.DataFrame(zj), "Curva sistema": pd.DataFrame(cu),
            "Golpe de ariete": ar, "Diámetros": pd.DataFrame(dm), "Accesorios": acc,
-           "Perfiles": pd.DataFrame(perf, columns=["Tramo", "Estación m", "Cota"])}
+           "Perfiles": pd.DataFrame(perf, columns=["Tramo", "Estación m", "Cota"]),
+           "Verif. nodos": pd.DataFrame(vn), "Verif. tuberías": pd.DataFrame(vt)}
+    g = cfg.get("gastos")
+    if g:
+        out["Gastos"] = pd.DataFrame([
+            ("Qmed", g["Qmed"]), ("QMD", g["QMD"]), ("QMH", g["QMH"]), ("Qmín", g["Qmin"]),
+            ("Qmáx instantáneo", g["Qmax_inst"]), ("Qmáx extraordinario", g["Qmax_ext"]),
+            ("Q de bombeo (usado)", g["Qbomba"])], columns=["Gasto", "lps"])
     if con_alternativas:
         alts = []
         for t in red.tramos:
@@ -288,9 +299,14 @@ def a_excel(cfg, res):
         for nombre, df in tb.items():
             df.round(3).to_excel(w, sheet_name=nombre[:31], index=False)
             ws = w.sheets[nombre[:31]]
+            from openpyxl.styles import PatternFill
+            verde, rojo = PatternFill("solid", fgColor="C6EFCE"), PatternFill("solid", fgColor="FFC7CE")
             for col in ws.columns:
                 ws.column_dimensions[col[0].column_letter].width = min(
                     45, max(len(str(c.value)) if c.value is not None else 0 for c in col) + 3)
+                for c in col:
+                    if c.value in ("CUMPLE", "NO CUMPLE"):
+                        c.fill = verde if c.value == "CUMPLE" else rojo
         pd.DataFrame(cfg["nodos"]).to_excel(w, sheet_name="Entrada nodos", index=False)
         pd.DataFrame([{k: v for k, v in t.items() if k != "perfil"} for t in cfg["tramos"]]).to_excel(
             w, sheet_name="Entrada tramos", index=False)
@@ -321,6 +337,12 @@ def _pag_tabla(pdf, titulo, df, filas=30):
         tb.set_fontsize(6.8)
         tb.auto_set_column_width(list(range(len(ch.columns))))
         tb.scale(1, 1.35)
+        for (r_, c_), cell in tb.get_celld().items():
+            txt = cell.get_text().get_text()
+            if r_ > 0 and txt == "CUMPLE":
+                cell.set_facecolor("#c6efce")
+            elif r_ > 0 and txt == "NO CUMPLE":
+                cell.set_facecolor("#ffc7ce")
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -336,7 +358,7 @@ def a_pdf(cfg, res):
             fig.text(0.07, y, f"{c}:", fontsize=10, fontweight="bold")
             fig.text(0.38, y, str(v), fontsize=10)
             y -= 0.03
-        for av in res.get("avisos", []):
+        for av in res.get("avisos", [])[:6]:
             fig.text(0.07, y, "Aviso: " + av, fontsize=8, color="#c00000")
             y -= 0.025
         nota = ("Notas: coeficientes, límites, rugosidades, K de accesorios y módulos de elasticidad son valores típicos "
@@ -349,7 +371,8 @@ def a_pdf(cfg, res):
         for nombre, f in todas_las_figuras(cfg, res).items():
             pdf.savefig(f, bbox_inches="tight")
             plt.close(f)
-        for nombre in ("Tramos", "Zanja y cotas", "Nodos", "Curva sistema", "Golpe de ariete", "Diámetros", "Alternativas DN"):
+        for nombre in ("Gastos", "Tramos", "Zanja y cotas", "Nodos", "Verif. nodos", "Verif. tuberías", "Curva sistema",
+                       "Golpe de ariete", "Diámetros", "Alternativas DN"):
             if nombre in tb and len(tb[nombre]):
                 _pag_tabla(pdf, nombre, tb[nombre])
         if len(tb["Accesorios"]):
