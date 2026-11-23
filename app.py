@@ -21,7 +21,8 @@ import exporta as ex
 
 st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide")
 
-MATS = list(bc.MATERIALES)
+MATCOLS = ["nombre", "C", "eps0_mm", "E_kgcm2", "espesor_mm", "P_trab_kgcm2"]
+MAT_BASE = ["PVC C-900", "PVC IPS", "PEAD", "ACERO", "FODU"]
 NODOS0 = pd.DataFrame([
     {"id": "B", "cota": 290.41, "demanda_lps": 0.0, "p_req_m": float("nan")},
     {"id": "T", "cota": 290.96, "demanda_lps": 0.0, "p_req_m": float("nan")},
@@ -30,29 +31,31 @@ NODOS0 = pd.DataFrame([
 ])
 COLS_T = ["id", "desde", "hasta", "L", "dn_pulg", "material", "clase", "prof_m", "K", "modo", "valor"]
 TRAMOS0 = pd.DataFrame([
-    ["B-T", "B", "T", 42.0, 6.0, "PVC", "RD 26", float("nan"), 0.0, "auto", 0.0],
-    ["T-Pte", "T", "Pte", 3474.55, 6.0, "PVC", "RD 26", float("nan"), 0.0, "lps", 12.0],
-    ["T-Ote", "T", "Ote", 2007.40, 4.0, "PVC", "RD 26", float("nan"), 0.0, "lps", 6.0]], columns=COLS_T)
+    ["B-T", "B", "T", 42.0, 6.0, "PVC C-900", "RD 25", float("nan"), 0.0, "auto", 0.0],
+    ["T-Pte", "T", "Pte", 3474.55, 6.0, "PVC C-900", "RD 25", float("nan"), 0.0, "lps", 12.0],
+    ["T-Ote", "T", "Ote", 2007.40, 4.0, "PVC C-900", "RD 25", float("nan"), 0.0, "lps", 6.0]], columns=COLS_T)
 ACC0 = pd.DataFrame(columns=["tramo", "tipo", "cant", "K"])
-CLASES_TODAS = sorted({c for m in bc.CLASES.values() for c in m})
+CLASES_TODAS = sorted({c for m in bc.CLASES.values() for c in m} | {"Única"})
 
 PARAMS = {
-    "g_modo": "qbomba", "g_pob": 5000.0, "g_dot": 150.0, "g_qmed": 8.0, "g_qbomba": 18.0, "g_cvd": 1.4,
-    "g_cvh": 1.55, "g_horas": 24.0, "g_tanque": True,
+    "g_modo": "qbomba", "g_pob": 0.0, "g_dot": 150.0, "g_qmed": 8.0, "g_qmd": 12.0, "g_qmh": 20.0,
+    "g_qbomba": 18.0, "g_mapas": True, "g_cvd": 1.4, "g_cvh": 1.55, "g_kmin": 0.5, "g_cs": 1.5, "g_M": 2.0,
+    "g_horas": 24.0, "g_tanque": True,
     "metodo": "DW", "edad_anios": 0, "grupo_agua": "II", "a_usuario": 0.0,
     "modo_menores": "pct", "pct_menores": 0.10, "colchon_min_m": 0.90,
     "presion_deseada_m": 15.0, "presion_min_perfil_m": 0.0, "escenarios": "0, 0.25, 0.5, 0.75, 1.0",
     "criterio_dn": "bresse", "v_obj": 1.5, "J_max_m_km": 4.0, "usar_opt": False, "tc_s": 0.0,
     "n_bombas": 1, "eficiencia_bomba": 0.65, "eficiencia_motor": 0.92, "factor_seguridad_motor": 1.15,
-    "npsh_requerido": 0.0, "p_min": 10.0, "p_max": 50.0, "v_min": 0.3, "v_max": 5.0,
-    "suc_nivel": 291.33, "suc_cota_eje": 290.41, "suc_L": 6.0, "suc_dn": 8.0, "suc_mat": "PVC",
-    "suc_clase": "RD 26", "suc_alt": 2240.0, "suc_temp": 20.0,
+    "npsh_requerido": 0.0, "p_min_kgcm2": 1.5, "p_max_kgcm2": 5.0, "v_min": 0.3, "v_max": 5.0,
+    "suc_nivel": 291.33, "suc_cota_eje": 290.41, "suc_L": 6.0, "suc_dn": 8.0, "suc_mat": "PVC C-900",
+    "suc_clase": "RD 25", "suc_alt": 2240.0, "suc_temp": 20.0,
 }
 ss = st.session_state
 ss.setdefault("ver", 0)
 ss.setdefault("nodos_base", NODOS0)
 ss.setdefault("tramos_base", TRAMOS0)
 ss.setdefault("acc_base", ACC0)
+ss.setdefault("mat_base", pd.DataFrame(columns=MATCOLS))
 ss.setdefault("perfiles", {})
 for k, v in PARAMS.items():
     ss.setdefault(k, v)
@@ -120,6 +123,7 @@ if up is not None:
         ss.nodos_base = pd.DataFrame(d["nodos"]).reindex(columns=NODOS0.columns).astype({"p_req_m": float})
         ss.tramos_base = pd.DataFrame([{k: v for k, v in t.items() if k != "perfil"} for t in d["tramos"]]).reindex(columns=COLS_T)
         ss.acc_base = pd.DataFrame(d.get("accesorios") or [], columns=ACC0.columns)
+        ss.mat_base = pd.DataFrame(d.get("materiales_personalizados") or [], columns=MATCOLS)
         ss.perfiles = {t["id"]: t["perfil"] for t in d["tramos"] if t.get("perfil")}
         for k in PARAMS:
             if k in d.get("_ui", {}):
@@ -166,6 +170,11 @@ with sb.expander("Bomba y motor"):
     if usa_curva:
         curva = st.data_editor(pd.DataFrame({"Q_lps": [0.0, 10.0, 20.0], "H_m": [45.0, 40.0, 28.0]}),
                                num_rows="fixed", key="curva_ed").values.tolist()
+with sb.expander("Otros materiales (personalizados)"):
+    st.caption("Define un material con sus coeficientes y la presión que soporta; luego elígelo por su nombre en la tabla de tramos "
+               "(clase «Única»). `espesor_mm` vacío = estimado; DN se toma como diámetro interior.")
+    mat_df = st.data_editor(ss.mat_base, num_rows="dynamic", key=f"mat_{ss.ver}", width="stretch")
+MATS = MAT_BASE + [str(n).upper().strip() for n in mat_df["nombre"].dropna() if str(n).strip()]
 with sb.expander("Succión"):
     st.number_input("Nivel de agua mínimo (msnm)", key="suc_nivel", format="%.2f")
     st.number_input("Cota del eje de la bomba (msnm)", key="suc_cota_eje", format="%.2f")
@@ -176,47 +185,66 @@ with sb.expander("Succión"):
     st.number_input("Altitud del sitio (msnm)", 0.0, 5000.0, key="suc_alt")
     st.number_input("Temperatura del agua (°C)", 0.0, 60.0, key="suc_temp")
     st.caption("Accesorios de la succión: en la pestaña Red, tramo «succion».")
-with sb.expander("Límites de verificación (típicos MAPAS; ajusta a tu norma)"):
-    st.number_input("Presión mínima (m.c.a.)", 0.0, 100.0, key="p_min")
-    st.number_input("Presión máxima (m.c.a.)", 0.0, 200.0, key="p_max")
+with sb.expander("Presión de suministro y velocidades", expanded=True):
+    st.number_input("Presión mínima de suministro (kg/cm²)", 0.0, 20.0, step=0.1, key="p_min_kgcm2",
+                    help="Predeterminado 1.5 kg/cm² (15 m.c.a.).")
+    st.number_input("Presión máxima de suministro (kg/cm²)", 0.0, 30.0, step=0.1, key="p_max_kgcm2",
+                    help="Predeterminado 5.0 kg/cm² (50 m.c.a.).")
+    if ss.presion_deseada_m < ss.p_min_kgcm2 * 10:
+        st.warning("La presión deseada en el punto crítico es menor que la presión mínima de suministro.")
     st.number_input("Velocidad mínima (m/s)", 0.0, 2.0, key="v_min")
     st.number_input("Velocidad máxima (m/s)", 0.5, 10.0, key="v_max")
 
 # ----------------------------------------------------------------------------- cuerpo
 st.title("Booster con presión constante")
 st.caption("Gastos → red y ramales → perfil y zanja → resultados, diámetros y golpe de ariete → exportar.")
-tabs = st.tabs(["1. Gastos", "2. Red", "3. Perfil y zanja", "4. Resultados", "5. Diámetros",
-                "6. Golpe de ariete", "7. Exportar"])
-t_gas, t_red, t_perf, t_res, t_dn, t_ar, t_exp = tabs
+tabs = st.tabs(["1. Gastos", "2. Red", "3. Perfil y zanja", "4. Resultados", "5. Verificación de presiones",
+                "6. Diámetros", "7. Golpe de ariete", "8. Exportar"])
+t_gas, t_red, t_perf, t_res, t_ver, t_dn, t_ar, t_exp = tabs
 
 with t_gas:
-    st.radio("¿Qué dato conoces?", ["poblacion", "qmed", "qbomba"], key="g_modo", horizontal=True,
-             format_func={"poblacion": "Población y dotación", "qmed": "Gasto medio (Qmed)",
-                          "qbomba": "Caudal a bombear"}.get)
-    c = st.columns(5)
+    LBL = {"poblacion": "Población y dotación", "qmed": "Gasto medio (Qmed)", "qmd": "Gasto máx. diario (QMD)",
+           "qmh": "Gasto máx. horario (QMH)", "qbomba": "Caudal a bombear"}
+    st.radio("¿Qué dato conoces?", list(LBL), key="g_modo", horizontal=True, format_func=LBL.get)
+    c = st.columns(4)
     if ss.g_modo == "poblacion":
-        c[0].number_input("Población", 0.0, 1e7, key="g_pob")
+        c[0].number_input("Población (hab)", 0.0, 1e7, key="g_pob")
         c[1].number_input("Dotación (l/hab/día)", 0.0, 1000.0, key="g_dot")
-    elif ss.g_modo == "qmed":
-        c[0].number_input("Qmed (lps)", 0.0, 1e5, key="g_qmed")
+        valor = 0.0
     else:
-        c[0].number_input("Caudal a bombear (lps)", 0.0, 1e5, key="g_qbomba")
-    if ss.g_modo != "qbomba":
-        c[2].number_input("CVD", 1.0, 2.0, key="g_cvd")
-        c[3].number_input("CVH", 1.0, 3.0, key="g_cvh")
-        st.checkbox("Hay tanque regulador (se bombea QMD en las horas de bombeo; si no, QMH)", key="g_tanque")
-        c[4].number_input("Horas de bombeo", 1.0, 24.0, key="g_horas")
-    gas = bc.calcula_gastos(ss.g_modo, ss.g_pob, ss.g_dot, ss.g_qmed, ss.g_qbomba, ss.g_cvd, ss.g_cvh,
-                            ss.g_horas, ss.g_tanque)
-    if ss.g_modo != "qbomba":
-        m = st.columns(4)
-        m[0].metric("Qmed", f"{gas['Qmed']:.2f} lps")
-        m[1].metric("QMD", f"{gas['QMD']:.2f} lps")
-        m[2].metric("QMH", f"{gas['QMH']:.2f} lps")
-        m[3].metric("Q de bombeo", f"{gas['Qbomba']:.2f} lps")
+        k_ = {"qmed": "g_qmed", "qmd": "g_qmd", "qmh": "g_qmh", "qbomba": "g_qbomba"}[ss.g_modo]
+        c[0].number_input(f"{LBL[ss.g_modo]} (lps)", 0.0, 1e5, key=k_)
+        valor = ss[k_]
+        c[1].number_input("Población (opcional, para Harmon)", 0.0, 1e7, key="g_pob")
+    c[2].number_input("Horas de bombeo", 1.0, 24.0, key="g_horas")
+    c[3].checkbox("Hay tanque regulador", key="g_tanque",
+                  help="Con tanque se bombea QMD·24/horas; sin tanque (directo a la red) la bomba da QMH.")
+    st.checkbox("Usar coeficientes predeterminados de MAPAS (CVD 1.40, CVH 1.55, Qmín 0.5·Qmed, CS 1.5)", key="g_mapas")
+    if ss.g_mapas:
+        cvd, cvh, kmin, cs = 1.4, 1.55, 0.5, 1.5
     else:
-        st.metric("Q de bombeo", f"{gas['Qbomba']:.2f} lps")
-    st.caption("CVD y CVH típicos de MAPAS: 1.2–1.4 y 1.5–1.8 según la localidad; confirma los de tu proyecto.")
+        d_ = st.columns(4)
+        cvd = d_[0].number_input("CVD (variación diaria)", 1.0, 2.5, key="g_cvd")
+        cvh = d_[1].number_input("CVH (variación horaria)", 1.0, 3.0, key="g_cvh")
+        kmin = d_[2].number_input("Qmín / Qmed", 0.1, 1.0, key="g_kmin")
+        cs = d_[3].number_input("CS (Qmáx ext / Qmáx inst)", 1.0, 3.0, key="g_cs")
+    if ss.g_pob <= 0 and ss.g_modo != "poblacion":
+        st.number_input("Coeficiente de Harmon M (sin población no se puede calcular)", 1.0, 5.0, key="g_M")
+    gas = bc.calcula_gastos(ss.g_modo, valor, ss.g_pob, ss.g_dot, cvd, cvh, ss.g_horas, ss.g_tanque, kmin, cs, ss.g_M)
+    M_ = gas["M"]
+    tab_g = pd.DataFrame([
+        ("Qmed", gas["Qmed"], "Gasto medio diario"),
+        ("QMD", gas["QMD"], f"Gasto máximo diario = CVD ({cvd:g}) · Qmed"),
+        ("QMH", gas["QMH"], f"Gasto máximo horario = CVH ({cvh:g}) · QMD"),
+        ("Qmín", gas["Qmin"], f"Gasto mínimo = {kmin:g} · Qmed"),
+        ("Qmáx inst.", gas["Qmax_inst"], f"Gasto máximo instantáneo = M ({M_:.2f}) · Qmed (Harmon)" if M_ else "requiere población o M"),
+        ("Qmáx ext.", gas["Qmax_ext"], f"Gasto máximo extraordinario = CS ({cs:g}) · Qmáx inst." if M_ else "requiere población o M"),
+        ("Q de bombeo", gas["Qbomba"], "USADO EN EL CÁLCULO (QMD·24/h con tanque; QMH sin tanque; o el dato directo)"),
+    ], columns=["Gasto", "lps", "Descripción"])
+    tab_g["m³/día"] = tab_g["lps"] * 86.4
+    st.dataframe(tab_g[["Gasto", "lps", "m³/día", "Descripción"]].round(2), width="stretch", hide_index=True)
+    st.caption("Qmed, QMD y QMH son los gastos de agua potable. Qmín, Qmáx inst. y Qmáx ext. se muestran como referencia "
+               "(definiciones de MAPAS de alcantarillado); no gobiernan el cálculo del booster. Verifica coeficientes con tu edición de MAPAS.")
 
 with t_red:
     st.subheader("Nodos")
@@ -252,7 +280,7 @@ def build_cfg():
     tramos = []
     for r in tramos_df.dropna(subset=["id", "desde", "hasta", "L", "dn_pulg"]).itertuples():
         t = {"id": str(r.id), "desde": str(r.desde), "hasta": str(r.hasta), "L": float(r.L), "dn_pulg": float(r.dn_pulg),
-             "material": nn(r.material, "PVC"), "clase": nn(r.clase, "RD 26"), "prof_m": nn(r.prof_m),
+             "material": nn(r.material, "PVC C-900"), "clase": nn(r.clase, "RD 25"), "prof_m": nn(r.prof_m),
              "K": float(nn(r.K, 0.0)), "modo": nn(r.modo, "auto"), "valor": float(nn(r.valor, 0.0))}
         if str(r.id) in ss.perfiles:
             t["perfil"] = ss.perfiles[str(r.id)]
@@ -272,7 +300,12 @@ def build_cfg():
         "factor_seguridad_motor": ss.factor_seguridad_motor, "npsh_requerido": ss.npsh_requerido or None,
         "curva_bomba": curva, "tc_s": ss.tc_s, "criterio_dn": ss.criterio_dn, "v_obj": ss.v_obj,
         "J_max_m_km": ss.J_max_m_km, "horas_bombeo": ss.g_horas,
-        "limites": {"p_min": ss.p_min, "p_max": ss.p_max, "v_min": ss.v_min, "v_max": ss.v_max},
+        "limites": {"p_min": ss.p_min_kgcm2 * 10, "p_max": ss.p_max_kgcm2 * 10, "v_min": ss.v_min, "v_max": ss.v_max},
+        "materiales_personalizados": [
+            {"nombre": str(r.nombre).upper().strip(), "C": nn(r.C), "eps0_mm": nn(r.eps0_mm), "E_kgcm2": nn(r.E_kgcm2),
+             "espesor_mm": nn(r.espesor_mm), "P_trab_kgcm2": nn(r.P_trab_kgcm2)}
+            for r in mat_df.dropna(subset=["nombre"]).itertuples() if str(r.nombre).strip()],
+        "gastos": gas,
         "succion": {"nivel_agua": ss.suc_nivel, "cota_eje_bomba": ss.suc_cota_eje, "L": ss.suc_L,
                     "dn_pulg": ss.suc_dn, "material": ss.suc_mat, "clase": ss.suc_clase, "K": 0.0,
                     "altitud_m": ss.suc_alt, "temp_c": ss.suc_temp},
@@ -384,6 +417,33 @@ with t_res:
     st.pyplot(fc)
     plt.close(fc)
     st.caption("Valores por defecto típicos de MAPAS-CONAGUA y bibliografía; confirma con la edición vigente, tu organismo operador y el fabricante.")
+
+
+def pinta(df, cols):
+    def c(v):
+        return ("background-color:#c6efce;color:#006100" if v == "CUMPLE"
+                else "background-color:#ffc7ce;color:#9c0006" if v == "NO CUMPLE" else "")
+    sty = df.style.format(precision=2, na_rep="—")
+    return sty.map(c, subset=cols) if hasattr(sty, "map") else sty.applymap(c, subset=cols)
+
+
+with t_ver:
+    if err:
+        st.stop()
+    vn, vt, ok_g = bc.verifica_presiones(cfg, res)
+    (st.success if ok_g else st.error)(
+        "CUMPLE: las presiones de suministro y de tubería están dentro de los límites." if ok_g
+        else "NO CUMPLE: revisa las filas marcadas en rojo.")
+    st.subheader("Presiones de suministro: resultado vs datos del proyecto")
+    st.caption(f"Proyecto: mínima {ss.p_min_kgcm2:g} kg/cm² y máxima {ss.p_max_kgcm2:g} kg/cm². Se verifican los nodos de consumo "
+               "(extremos y nodos con demanda). `P máx. operación` = mayor presión entre los escenarios de gasto y la tubería nueva "
+               "con la bomba a la CDT de diseño.")
+    st.dataframe(pinta(pd.DataFrame(vn), ["Mínima", "Máxima"]), width="stretch", hide_index=True)
+    st.subheader("Presión de la tubería: resultado vs presión que soporta")
+    st.caption("`Soporta` = presión de trabajo de la clase (PVC C-900: RD 25 = 11.6, RD 18 = 16.5, RD 14 = 21.4 kg/cm²; "
+               "otros materiales según su tabla). «Con ariete» suma la sobrepresión estimada (pestaña Golpe de ariete). "
+               "Verifica con el fabricante la sobrepresión transitoria admisible de la clase.")
+    st.dataframe(pinta(pd.DataFrame(vt), ["Operación", "Con ariete"]), width="stretch", hide_index=True)
 
 
 @st.cache_data(show_spinner="Calculando alternativas...")
