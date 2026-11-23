@@ -27,13 +27,18 @@ OD_IPS = {2: 60.3, 2.5: 73.0, 3: 88.9, 4: 114.3, 6: 168.3, 8: 219.1, 10: 273.1, 
           16: 406.4, 18: 457.2, 20: 508.0, 24: 609.6, 30: 762.0, 36: 914.4}       # DN (pulg) -> D ext (mm)
 OD_IPS = {float(k): v for k, v in OD_IPS.items()}
 DN_LISTA = sorted(OD_IPS)
+# PVC AWWA C-900 / C-905 (D ext. controlado por equivalencia a hierro fundido)
+OD_C900 = {4.0: 121.9, 6.0: 175.3, 8.0: 229.9, 10.0: 281.9, 12.0: 335.3, 14.0: 388.6, 16.0: 442.0, 18.0: 495.3,
+           20.0: 548.6, 24.0: 655.3}
+RD_C900 = {"RD 25": (25, 11.6), "RD 18": (18, 16.5), "RD 14": (14, 21.4)}      # (RD, presión de trabajo kg/cm2)
 # clase -> (RD, presión de trabajo kg/cm2)
 RD_PVC = {"RD 41": (41, 7.0), "RD 32.5": (32.5, 8.8), "RD 26": (26, 11.2), "RD 21": (21, 14.1), "RD 13.5": (13.5, 28.1)}
 RD_PEAD = {"RD 26": (26, 6.4), "RD 21": (21, 8.2), "RD 17": (17, 10.2), "RD 13.6": (13.6, 12.7), "RD 11": (11, 16.3)}
-CLASES = {"PVC": RD_PVC, "PEAD": RD_PEAD, "ACERO": {"Estándar": (None, None)}, "FODU": {"K9": (None, None)}}
+CLASES = {"PVC C-900": RD_C900, "PVC IPS": RD_PVC, "PEAD": RD_PEAD, "ACERO": {"Estándar": (None, None)}, "FODU": {"K9": (None, None)}}
 # C: Hazen-Williams (nuevo) | eps0: rugosidad tubo nuevo (mm) | E: módulo de elasticidad (kg/cm2)
 MATERIALES = {
-    "PVC": {"C": 140, "eps0": 0.0015, "E": 2.81e4},
+    "PVC C-900": {"C": 140, "eps0": 0.0015, "E": 2.81e4},
+    "PVC IPS": {"C": 140, "eps0": 0.0015, "E": 2.81e4},
     "PEAD": {"C": 140, "eps0": 0.0015, "E": 1.0e4},
     "ACERO": {"C": 120, "eps0": 0.05, "E": 2.1e6},
     "FODU": {"C": 140, "eps0": 0.12, "E": 1.7e6},
@@ -58,33 +63,93 @@ def _nan(x):
     return x is None or (isinstance(x, float) and math.isnan(x))
 
 
+_BASE_MAT, _BASE_CLASES = set(MATERIALES), set(CLASES)
+CUSTOM: dict = {}
+
+
+def mat_key(m) -> str:
+    k = str(m).upper().strip().replace("C900", "C-900")
+    return {"PVC": "PVC IPS"}.get(k, k)
+
+
+def registra_materiales(cfg: dict) -> None:
+    """Materiales definidos por el usuario: nombre, C, eps0_mm, E_kgcm2, espesor_mm (opc.), P_trab_kgcm2."""
+    for k in [k for k in MATERIALES if k not in _BASE_MAT]:
+        del MATERIALES[k]
+    for k in [k for k in CLASES if k not in _BASE_CLASES]:
+        del CLASES[k]
+    CUSTOM.clear()
+    for m in cfg.get("materiales_personalizados") or []:
+        nom = mat_key(m["nombre"])
+        MATERIALES[nom] = {"C": float(m.get("C") or 130), "eps0": float(m.get("eps0_mm") or 0.1),
+                           "E": float(m.get("E_kgcm2") or 2.0e5)}
+        CUSTOM[nom] = {"e_mm": m.get("espesor_mm"), "P_kgcm2": m.get("P_trab_kgcm2")}
+        CLASES[nom] = {"Única": (None, None)}
+
+
+def clases_de(material) -> dict:
+    return CLASES.get(mat_key(material), {"Única": (None, None)})
+
+
+def dn_lista(material):
+    mk = mat_key(material)
+    return sorted(OD_C900) if mk == "PVC C-900" else (sorted(OD_IPS) if mk in ("PVC IPS", "PEAD") else DN_LISTA)
+
+
 # ----------------------------------------------------------------------------- gastos
-def calcula_gastos(modo: str, poblacion=0.0, dotacion=0.0, qmed=0.0, qbomba=0.0, cvd=1.4, cvh=1.55,
-                   horas=24.0, con_tanque=True) -> dict:
-    """modo: 'poblacion' | 'qmed' | 'qbomba'. Con tanque regulador se bombea QMD*24/horas; directo a red, QMH."""
-    if modo == "qbomba":
-        return {"Qmed": None, "QMD": None, "QMH": None, "Qbomba": float(qbomba)}
+def harmon(poblacion: float):
+    """Coeficiente de Harmon M = 1 + 14/(4+sqrt(P)), P en miles de hab. (3.8 si P<1000; 2.0 si P>63 454)."""
+    if poblacion <= 0:
+        return None
+    if poblacion < 1000:
+        return 3.8
+    if poblacion > 63454:
+        return 2.0
+    return 1 + 14 / (4 + math.sqrt(poblacion / 1000.0))
+
+
+def calcula_gastos(modo, valor=0.0, poblacion=0.0, dotacion=0.0, cvd=1.4, cvh=1.55, horas=24.0,
+                   con_tanque=True, k_min=0.5, cs_ext=1.5, M_manual=None) -> dict:
+    """A partir del dato conocido (modo: poblacion | qmed | qmd | qmh | qbomba) obtiene todos los gastos.
+    QMD = CVD·Qmed; QMH = CVH·QMD; Qmin = k_min·Qmed; Qmáx inst = M·Qmed (Harmon); Qmáx ext = CS·Qmáx inst.
+    Con tanque regulador se bombea QMD·24/horas; directo a la red, QMH."""
     if modo == "poblacion":
         qmed = poblacion * dotacion / 86400.0
+    elif modo == "qmed":
+        qmed = valor
+    elif modo == "qmd":
+        qmed = valor / cvd
+    elif modo == "qmh":
+        qmed = valor / (cvd * cvh)
+    else:                                            # qbomba
+        qmed = (valor * horas / 24.0 if con_tanque else valor / cvh) / cvd
     qmd, qmh = qmed * cvd, qmed * cvd * cvh
-    return {"Qmed": qmed, "QMD": qmd, "QMH": qmh, "Qbomba": qmd * 24.0 / horas if con_tanque else qmh}
+    M = harmon(poblacion) or (M_manual or None)
+    qmi = M * qmed if M else None
+    return {"Qmed": qmed, "QMD": qmd, "QMH": qmh, "Qmin": k_min * qmed, "Qmax_inst": qmi,
+            "Qmax_ext": cs_ext * qmi if qmi else None, "M": M,
+            "Qbomba": valor if modo == "qbomba" else (qmd * 24.0 / horas if con_tanque else qmh)}
 
 
 # ----------------------------------------------------------------------------- geometría
 def geometria(material: str, dn: float, clase: str) -> dict:
-    mat, dn = material.upper(), float(dn)
-    if mat in ("PVC", "PEAD"):
-        if dn not in OD_IPS:
-            raise ValueError(f"DN {dn}\" no disponible en el catálogo de {mat}")
-        tab = CLASES[mat]
-        if clase not in tab:
-            raise ValueError(f"Clase '{clase}' inválida para {mat}: use {list(tab)}")
-        rd, p = tab[clase]
-        od = OD_IPS[dn]
+    mk, dn = mat_key(material), float(dn)
+    if mk in ("PVC C-900", "PVC IPS", "PEAD"):
+        tabla = OD_C900 if mk == "PVC C-900" else OD_IPS
+        if dn not in tabla:
+            raise ValueError(f"DN {dn:g}\" no disponible en {mk} (disponibles: {sorted(tabla)})")
+        tab = CLASES[mk]
+        rd, p = tab.get(clase) or next(iter(tab.values()))
+        od = tabla[dn]
         e = od / rd
         return {"D_int": od - 2 * e, "D_ext": od, "e": e, "P_m": p * 10.0}
-    d = dn * 25.4                                   # acero / hierro dúctil: DN ≈ diámetro interior
-    e = max(4.8, d / 60) if mat == "ACERO" else 9 * (0.5 + 0.001 * d)
+    d = dn * 25.4                                   # otros materiales: DN ≈ diámetro interior
+    cu = CUSTOM.get(mk)
+    if cu is not None:
+        e = float(cu["e_mm"]) if not _nan(cu.get("e_mm")) and cu.get("e_mm") else max(4.8, d / 60)
+        pm = float(cu["P_kgcm2"]) * 10 if not _nan(cu.get("P_kgcm2")) and cu.get("P_kgcm2") else None
+        return {"D_int": d, "D_ext": d + 2 * e, "e": e, "P_m": pm}
+    e = max(4.8, d / 60) if mk == "ACERO" else 9 * (0.5 + 0.001 * d)
     return {"D_int": d, "D_ext": d + 2 * e, "e": e, "P_m": None}
 
 
@@ -116,8 +181,8 @@ class Tramo:
     hasta: str
     L: float
     dn_pulg: float
-    material: str = "PVC"
-    clase: str = "RD 26"
+    material: str = "PVC C-900"
+    clase: str = "RD 25"
     prof_m: Optional[float] = None                  # profundidad de zanja (fondo); None = mínima MAPAS
     K: float = 0.0                                  # K adicional manual
     modo: str = "auto"                              # reparto: auto | pct | lps
@@ -135,9 +200,15 @@ class Tramo:
     dz: float = field(default=0.0, init=False)
     terreno: list = field(default_factory=list, init=False)
     eje: list = field(default_factory=list, init=False)
+    aviso: str = field(default="", init=False)
 
 
 def prepara_tramo(t: Tramo, cfg: dict, ksum_acc: float = 0.0) -> None:
+    tab = clases_de(t.material)
+    if t.clase not in tab:
+        nueva = next(iter(tab))
+        t.aviso = f"Tramo {t.id}: la clase '{t.clase}' no existe para {t.material}; se usó {nueva}."
+        t.clase = nueva
     g = geometria(t.material, t.dn_pulg, t.clase)
     t.D_mm, t.D_ext, t.e_mm = g["D_int"], g["D_ext"], g["e"]
     t.P_clase_m = t.P_trab_kgcm2 * 10 if not _nan(t.P_trab_kgcm2) and t.P_trab_kgcm2 else g["P_m"]
@@ -207,7 +278,7 @@ def eps_tubo_mm(material: str, cfg: dict) -> float:
     a = cfg.get("a_envejec_mm_anio")
     if _nan(a):
         a = GRUPOS_AGUA.get(cfg.get("grupo_agua", "II"), ("", 0.07))[1]
-    return MATERIALES.get(material.upper(), {"eps0": 0.1})["eps0"] + a * float(cfg.get("edad_anios", 0) or 0)
+    return MATERIALES.get(mat_key(material), {"eps0": 0.1})["eps0"] + a * float(cfg.get("edad_anios", 0) or 0)
 
 
 def perdida_tramo(t, q_lps: float, cfg: dict):
@@ -220,7 +291,7 @@ def perdida_tramo(t, q_lps: float, cfg: dict):
     V = Q / A
     edad = float(cfg.get("edad_anios", 0) or 0)
     if cfg.get("metodo", "DW").upper() == "HW" and edad <= 0:
-        C = MATERIALES.get(t.material.upper(), {"C": 130})["C"]
+        C = MATERIALES.get(mat_key(t.material), {"C": 130})["C"]
         hf = 10.67 * t.L * Q ** 1.852 / (C ** 1.852 * D ** 4.87)
     else:
         eps = eps_tubo_mm(t.material, cfg) / 1000.0
@@ -359,20 +430,22 @@ def resolver(red: Red, k: float, cfg: dict) -> dict:
         d = det[t.id]
         pm = min(hgl[t.desde] - (d["hf"] + d["hm"]) * x / (t.L or 1.0) - z for x, z in t.eje)
         d["p_min_linea"] = pm
+        d["p_max_linea"] = max(hgl[t.desde] - (d["hf"] + d["hm"]) * x / (t.L or 1.0) - z for x, z in t.eje)
     return {"k": k, "Q": Qtot, "H_desc": H, "crit": crit, "det": det, "pres": pres, "acum": acum,
             "req": req, "hgl": hgl}
 
 
 def analizar(cfg: dict) -> dict:
+    registra_materiales(cfg)
     nodos = [Nodo(**n) for n in cfg["nodos"]]
     tramos = [Tramo(**t) for t in cfg["tramos"]]
     red = Red(nodos, tramos, cfg["raiz"], cfg)
     s = cfg["succion"]
-    ts = Tramo("succion", "tanque", "bomba", s.get("L", 0.0), s["dn_pulg"], s.get("material", "PVC"),
-               s.get("clase", "RD 26"), None, s.get("K", 0.0))
+    ts = Tramo("succion", "tanque", "bomba", s.get("L", 0.0), s["dn_pulg"], s.get("material", "PVC C-900"),
+               s.get("clase", "RD 25"), None, s.get("K", 0.0))
     ksuc = sum(float(a["cant"]) * float(a["K"]) for a in cfg.get("accesorios", []) or [] if a["tramo"] == "succion")
     prepara_tramo(ts, cfg, ksuc)
-    avisos = []
+    avisos = [t.aviso for t in tramos + [ts] if t.aviso]
     if cfg.get("metodo", "DW").upper() == "HW" and (cfg.get("edad_anios", 0) or 0) > 0:
         avisos.append("Con tubería envejecida se usa Darcy-Weisbach (eps_t = eps_0 + a·t); Hazen-Williams solo aplica a tubería nueva.")
     esc = []
@@ -444,7 +517,7 @@ def equipo(cfg, res):
 # ----------------------------------------------------------------------------- golpe de ariete
 def celeridad(t) -> float:
     """Allievi (MAPAS): a = 1420 / sqrt(1 + (Ev/E)(D/e))  [m/s]."""
-    E = MATERIALES.get(t.material.upper(), {"E": 2.0e6})["E"]
+    E = MATERIALES.get(mat_key(t.material), {"E": 2.0e6})["E"]
     return 1420.0 / math.sqrt(1.0 + (EV_KGCM2 / E) * (t.D_mm / t.e_mm))
 
 
@@ -480,6 +553,49 @@ def ariete(cfg, res):
     return filas
 
 
+# ----------------------------------------------------------------------------- verificación de presiones
+def verifica_presiones(cfg, res):
+    """Compara resultados contra (a) presiones mínima/máxima de suministro del proyecto en nodos de consumo y
+    (b) presión que soporta la tubería (clase) en cada tramo, en operación y con golpe de ariete."""
+    red, dis, nueva, lim = res["red"], diseno(res), res["nueva"], cfg["limites"]
+    sumin = set(red.terminales()) | {n for n, nd in red.nodos.items() if not _nan(nd.demanda_lps) and nd.demanda_lps > 0}
+    k = 10.0
+    nodos = []
+    for nid, p in dis["pres"].items():
+        if nid == red.raiz:
+            continue
+        p_new = dis["H_desc"] - nueva["acum"][nid] - red.z_tub[nid]
+        p_max = max(max(r["pres"][nid] for r in res["esc"]), p_new)
+        sup = nid in sumin
+        ok_min = p >= lim["p_min"] - 1e-6
+        ok_max = p_max <= lim["p_max"] + 1e-6
+        nodos.append({"Nodo": nid, "Tipo": "suministro" if sup else "intermedio", "P diseño kg/cm²": p / k,
+                      "P máx. operación kg/cm²": p_max / k, "P mín. proyecto kg/cm²": lim["p_min"] / k,
+                      "P máx. proyecto kg/cm²": lim["p_max"] / k,
+                      "Mínima": ("CUMPLE" if ok_min else "NO CUMPLE") if sup else "n/a",
+                      "Máxima": ("CUMPLE" if ok_max else "NO CUMPLE") if sup else "n/a",
+                      "Acción": ("" if (not sup or (ok_min and ok_max)) else
+                                 ("Aumentar CDT o reducir pérdidas" if not ok_min else "Instalar válvula reductora (VRP)"))})
+    ar = {a["Tramo"]: a for a in ariete(cfg, res)}
+    tub = []
+    for t in red.tramos:
+        p_op = max(r["det"][t.id]["p_max_linea"] for r in res["esc"])
+        dn_ = nueva["det"][t.id]
+        pn = max(dis["H_desc"] - nueva["acum"][t.desde] - (dn_["hf"] + dn_["hm"]) * x / (t.L or 1.0) - z for x, z in t.eje)
+        p_tr = max(p_op, pn)
+        dH = ar[t.id]["ΔH m"]
+        cl = t.P_clase_m
+        tub.append({"Tramo": t.id, "Material": t.material, "Clase": t.clase,
+                    "P trabajo máx. kg/cm²": p_tr / k, "Soporta kg/cm²": None if cl is None else cl / k,
+                    "Operación": "SIN DATO" if cl is None else ("CUMPLE" if p_tr <= cl else "NO CUMPLE"),
+                    "ΔH ariete kg/cm²": dH / k, "P con ariete kg/cm²": (p_tr + dH) / k,
+                    "Con ariete": "SIN DATO" if cl is None else ("CUMPLE" if p_tr + dH <= cl else "NO CUMPLE"),
+                    "Margen kg/cm²": None if cl is None else (cl - p_tr - dH) / k})
+    ok = all(r["Mínima"] != "NO CUMPLE" and r["Máxima"] != "NO CUMPLE" for r in nodos) and \
+        all(r["Operación"] != "NO CUMPLE" and r["Con ariete"] != "NO CUMPLE" for r in tub)
+    return nodos, tub, ok
+
+
 # ----------------------------------------------------------------------------- diámetros
 def dn_optimo(Q_lps, material, clase, cfg):
     """Diámetro óptimo (criterio en cfg['criterio_dn']):
@@ -492,9 +608,9 @@ def dn_optimo(Q_lps, material, clase, cfg):
     if crit == "bresse":
         X = cfg.get("horas_bombeo", 24.0) / 24.0
         Db = 1.3 * X ** 0.25 * math.sqrt(Q_lps / 1000.0) * 1000
-        return min(DN_LISTA, key=lambda dn: abs(geometria(material, dn, clase)["D_int"] - Db))
-    C = MATERIALES.get(material.upper(), {"C": 130})["C"]
-    for dn in DN_LISTA:
+        return min(dn_lista(material), key=lambda dn: abs(geometria(material, dn, clase)["D_int"] - Db))
+    C = MATERIALES.get(mat_key(material), {"C": 130})["C"]
+    for dn in dn_lista(material):
         D = geometria(material, dn, clase)["D_int"] / 1000
         if crit == "gradiente":
             J = 10.67 * (Q_lps / 1000) ** 1.852 / (C ** 1.852 * D ** 4.87) * 1000
@@ -502,7 +618,7 @@ def dn_optimo(Q_lps, material, clase, cfg):
                 return dn
         elif (Q_lps / 1000) / (math.pi * D ** 2 / 4) <= cfg.get("v_obj", 1.5):
             return dn
-    return DN_LISTA[-1]
+    return dn_lista(material)[-1]
 
 
 def _rapido(cfg):
@@ -516,7 +632,7 @@ def optimiza_diametros(cfg):
     c = copy.deepcopy(cfg)
     dis = diseno(analizar(_rapido(c)))
     for t in c["tramos"]:
-        dn = dn_optimo(dis["det"][t["id"]]["Q"], t.get("material", "PVC"), t.get("clase", "RD 26"), c)
+        dn = dn_optimo(dis["det"][t["id"]]["Q"], t.get("material", "PVC C-900"), t.get("clase", "RD 25"), c)
         if dn is not None:
             t["dn_pulg"] = dn
     return c
@@ -528,9 +644,10 @@ def alternativas(cfg, tramo_id):
     res0 = analizar(base)
     Q = diseno(res0)["det"][tramo_id]["Q"]
     t0 = next(t for t in base["tramos"] if t["id"] == tramo_id)
-    opt = dn_optimo(Q, t0.get("material", "PVC"), t0.get("clase", "RD 26"), base) or t0["dn_pulg"]
-    i = DN_LISTA.index(opt)
-    cand = [DN_LISTA[j] for j in (i - 1, i, i + 1) if 0 <= j < len(DN_LISTA)]
+    opt = dn_optimo(Q, t0.get("material", "PVC C-900"), t0.get("clase", "RD 25"), base) or t0["dn_pulg"]
+    lista = dn_lista(t0.get("material", "PVC C-900"))
+    i = lista.index(opt) if opt in lista else 0
+    cand = [lista[j] for j in (i - 1, i, i + 1) if 0 <= j < len(lista)]
     if t0["dn_pulg"] not in cand:
         cand.append(t0["dn_pulg"])
     eq0 = equipo(base, res0)
@@ -575,16 +692,16 @@ DEFAULTS = {
     "presion_deseada_m": 15.0, "presion_min_perfil_m": 0.0, "escenarios": [0.0, 0.25, 0.5, 0.75, 1.0],
     "n_bombas": 1, "eficiencia_bomba": 0.65, "eficiencia_motor": 0.92, "factor_seguridad_motor": 1.15,
     "npsh_requerido": None, "curva_bomba": None, "tc_s": 0.0, "criterio_dn": "bresse", "v_obj": 1.5, "J_max_m_km": 4.0,
-    "horas_bombeo": 24.0, "limites": {"p_min": 10.0, "p_max": 50.0, "v_min": 0.3, "v_max": 5.0},
+    "horas_bombeo": 24.0, "limites": {"p_min": 15.0, "p_max": 50.0, "v_min": 0.3, "v_max": 5.0},      # m.c.a. = 1.5 y 5.0 kg/cm2
 }
 EJEMPLO = {
     "raiz": "B", "Q_bombeo_lps": 18.0,
     "nodos": [{"id": "B", "cota": 290.41}, {"id": "T", "cota": 290.96},
               {"id": "Pte", "cota": 303.00}, {"id": "Ote", "cota": 279.65}],
     "tramos": [
-        {"id": "B-T", "desde": "B", "hasta": "T", "L": 42.0, "dn_pulg": 6},
-        {"id": "T-Pte", "desde": "T", "hasta": "Pte", "L": 3474.55, "dn_pulg": 6, "modo": "lps", "valor": 12},
-        {"id": "T-Ote", "desde": "T", "hasta": "Ote", "L": 2007.40, "dn_pulg": 4, "modo": "lps", "valor": 6}],
+        {"id": "B-T", "desde": "B", "hasta": "T", "L": 42.0, "dn_pulg": 6.0},
+        {"id": "T-Pte", "desde": "T", "hasta": "Pte", "L": 3474.55, "dn_pulg": 6.0, "modo": "lps", "valor": 12},
+        {"id": "T-Ote", "desde": "T", "hasta": "Ote", "L": 2007.40, "dn_pulg": 4.0, "modo": "lps", "valor": 6}],
     "succion": {"nivel_agua": 291.33, "cota_eje_bomba": 290.41, "L": 6.0, "dn_pulg": 8, "altitud_m": 2240, "temp_c": 20},
 }
 
