@@ -15,6 +15,7 @@ from matplotlib.patches import Circle, Patch, Rectangle  # noqa: E402
 import booster_cdt as bc  # noqa: E402
 
 equipo = bc.equipo
+VERSION = "4"
 _diseno = bc.diseno
 
 
@@ -268,8 +269,59 @@ def perfiles_fig(res):
     return fig
 
 
+def zanja_fig(t):
+    """Sección transversal de la zanja de un tramo (cotas al inicio del tramo)."""
+    D, r, cama, prof = t.D_ext / 1000.0, t.D_ext / 2000.0, 0.05, t.prof
+    W, colchon = bc.ancho_zanja(t.D_ext), t.prof - 0.05 - t.D_ext / 1000.0
+    lat = (W - D) / 2
+    zt, ze = t.terreno[0][1], t.eje[0][1]
+    fig, ax = plt.subplots(figsize=(8, 5.6))
+    m, fondo = 1.1, 0.4
+    ax.add_patch(Rectangle((-W / 2 - m, -prof - fondo), m, prof + fondo, fc="#d9c9ad", ec="none"))
+    ax.add_patch(Rectangle((W / 2, -prof - fondo), m, prof + fondo, fc="#d9c9ad", ec="none"))
+    ax.add_patch(Rectangle((-W / 2, -prof - fondo), W, fondo, fc="#d9c9ad", ec="none"))
+    ax.add_patch(Rectangle((-W / 2, -prof + cama), W, prof - cama, fc="#f1e9d6", ec="none", label="Relleno compactado"))
+    ax.add_patch(Rectangle((-W / 2, -prof), W, cama, fc="#c9a66b", ec="none", label="Cama de arena (5 cm)"))
+    ax.add_patch(Circle((0, -prof + cama + r), r, fc="#9aa5b1", ec="k", lw=1.4, label="Tubería"))
+    ax.add_patch(Circle((0, -prof + cama + r), t.D_mm / 2000.0, fc="#cfe8ff", ec="k", lw=0.6))
+    ax.plot([-W / 2 - m, W / 2 + m], [0, 0], "k", lw=1.8)
+    for xs, ys in (([-W / 2, -W / 2], [0, -prof]), ([W / 2, W / 2], [0, -prof]), ([-W / 2, W / 2], [-prof, -prof])):
+        ax.plot(xs, ys, "k", lw=1.2)
+    rojo = "#c00000"
+
+    def v(x, y1, y2, txt, dx=0.06, ha="left"):
+        ax.annotate("", xy=(x, y1), xytext=(x, y2), arrowprops=dict(arrowstyle="<->", lw=1, color=rojo))
+        ax.text(x + dx, (y1 + y2) / 2, txt, fontsize=8.5, va="center", ha=ha, color=rojo,
+                bbox=dict(fc="white", ec="none", alpha=.85, pad=1))
+
+    xr = W / 2 + 0.55
+    v(xr, 0, -prof, f"Profundidad\n{prof:.2f} m")
+    v(-W / 2 - 0.55, 0, -colchon, f"Colchón\n{colchon:.2f} m", dx=-0.06, ha="right")
+    v(-W / 2 - 0.55, -colchon, -colchon - D, f"Ø ext.\n{t.D_ext:.0f} mm", dx=-0.06, ha="right")
+    ax.annotate("", xy=(-W / 2, 0.3), xytext=(W / 2, 0.3), arrowprops=dict(arrowstyle="<->", lw=1, color=rojo))
+    ax.text(0, 0.34, f"Ancho de zanja = {W:.2f} m (D ext. + {0.5 if D < 0.5 else 0.6:.2f})", ha="center", fontsize=8.5, color=rojo)
+    ax.annotate(f"Cama {cama * 100:.0f} cm", xy=(W / 2 - 0.03, -prof + cama / 2), xytext=(W / 2 + 0.25, -prof - 0.28),
+                fontsize=8, arrowprops=dict(arrowstyle="->", lw=.8), ha="left")
+    ax.text(0, -prof + cama + r, f"Øint\n{t.D_mm:.0f}", ha="center", va="center", fontsize=7)
+    ax.text(W / 2 + m + 0.55, -0.25 * prof,
+            f"Cota terreno  {zt:.2f}\nCota plantilla {zt - prof:.2f}\nCota eje tubería {ze:.2f}\nCota clave {ze + r:.2f}",
+            fontsize=8.5, va="top", family="monospace", bbox=dict(fc="white", ec="0.6", pad=4))
+    aviso = "" if prof >= t.prof_min - 1e-9 else f"\n¡Profundidad menor a la mínima ({t.prof_min:.2f} m)!"
+    ax.set_title(f"Sección de zanja - tramo {t.id}: {t.material} {t.clase}, DN {t.dn_pulg:g}\"" + aviso,
+                 fontsize=10, color=rojo if aviso else "k")
+    ax.set_xlim(-W / 2 - m - 0.9, W / 2 + m + 3.4)
+    ax.set_ylim(-prof - fondo - 0.1, 0.7)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.legend(loc="lower left", fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
 def todas_las_figuras(cfg, res):
     figs = {"esquema": esquema_fig(cfg, res), "curva_sistema": curva_fig(cfg, res)}
+    for t in res["red"].tramos:
+        figs[f"zanja_{t.id}"] = zanja_fig(t)
     for t in res["red"].terminales():
         figs[f"perfil_{t}"] = perfil_fig(res, t)
     return figs
