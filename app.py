@@ -21,25 +21,53 @@ import exporta as ex
 
 st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide")
 
+APP_VERSION = "4"
+if getattr(bc, "VERSION", None) != APP_VERSION or getattr(ex, "VERSION", None) != APP_VERSION:
+    st.error(
+        "Los archivos no son de la misma versión. Sube a la misma carpeta (reemplazando los anteriores) "
+        f"app_booster.py, booster_cdt.py y exporta.py de la versión {APP_VERSION}. "
+        f"Encontrado: booster_cdt={getattr(bc, 'VERSION', 'antigua')}, exporta={getattr(ex, 'VERSION', 'antigua')}.")
+    st.stop()
+
 MATCOLS = ["nombre", "C", "eps0_mm", "E_kgcm2", "espesor_mm", "P_trab_kgcm2"]
 MAT_BASE = ["PVC C-900", "PVC IPS", "PEAD", "ACERO", "FODU"]
-NODOS0 = pd.DataFrame([
-    {"id": "B", "cota": 290.41, "demanda_lps": 0.0, "p_req_m": float("nan")},
-    {"id": "T", "cota": 290.96, "demanda_lps": 0.0, "p_req_m": float("nan")},
-    {"id": "Pte", "cota": 303.00, "demanda_lps": 0.0, "p_req_m": float("nan")},
-    {"id": "Ote", "cota": 279.65, "demanda_lps": 0.0, "p_req_m": float("nan")},
-])
+COLS_N = ["id", "cota", "demanda_lps", "p_req_m"]
 COLS_T = ["id", "desde", "hasta", "L", "dn_pulg", "material", "clase", "prof_m", "K", "modo", "valor"]
-TRAMOS0 = pd.DataFrame([
-    ["B-T", "B", "T", 42.0, 6.0, "PVC C-900", "RD 25", float("nan"), 0.0, "auto", 0.0],
-    ["T-Pte", "T", "Pte", 3474.55, 6.0, "PVC C-900", "RD 25", float("nan"), 0.0, "lps", 12.0],
-    ["T-Ote", "T", "Ote", 2007.40, 4.0, "PVC C-900", "RD 25", float("nan"), 0.0, "lps", 6.0]], columns=COLS_T)
+NODOS0 = pd.DataFrame({"id": pd.Series(dtype="object"), "cota": pd.Series(dtype="float"),
+                       "demanda_lps": pd.Series(dtype="float"), "p_req_m": pd.Series(dtype="float")})
+TRAMOS0 = pd.DataFrame({"id": pd.Series(dtype="object"), "desde": pd.Series(dtype="object"),
+                        "hasta": pd.Series(dtype="object"), "L": pd.Series(dtype="float"),
+                        "dn_pulg": pd.Series(dtype="float"), "material": pd.Series(dtype="object"),
+                        "clase": pd.Series(dtype="object"), "prof_m": pd.Series(dtype="float"),
+                        "K": pd.Series(dtype="float"), "modo": pd.Series(dtype="object"),
+                        "valor": pd.Series(dtype="float")})
+NAN = float("nan")
+EJEMPLOS = {
+    "Red en T (2 ramales)": {
+        "nodos": [["B", 290.41, 0.0, NAN], ["T", 290.96, 0.0, NAN], ["Pte", 303.00, 0.0, NAN], ["Ote", 279.65, 0.0, NAN]],
+        "tramos": [["B-T", "B", "T", 42.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
+                   ["T-Pte", "T", "Pte", 3474.55, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "lps", 12.0],
+                   ["T-Ote", "T", "Ote", 2007.40, 4.0, "PVC C-900", "RD 25", NAN, 0.0, "lps", 6.0]],
+        "params": {"g_modo": "qbomba", "g_qbomba": 18.0, "suc_nivel": 291.33, "suc_cota_eje": 290.41, "suc_alt": 2240.0}},
+    "Línea simple (un solo tramo)": {
+        "nodos": [["B", 100.0, 0.0, NAN], ["N", 130.0, 0.0, NAN]],
+        "tramos": [["B-N", "B", "N", 1200.0, 4.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0]],
+        "params": {"g_modo": "qbomba", "g_qbomba": 8.0, "suc_nivel": 101.0, "suc_cota_eje": 100.0, "suc_alt": 500.0}},
+    "Tres ramales con reparto automático": {
+        "nodos": [["B", 500.0, 0.0, NAN], ["N", 502.0, 0.0, NAN], ["R1", 520.0, 0.0, NAN],
+                  ["R2", 495.0, 0.0, NAN], ["R3", 510.0, 0.0, NAN]],
+        "tramos": [["B-N", "B", "N", 80.0, 8.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
+                   ["N-R1", "N", "R1", 1500.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
+                   ["N-R2", "N", "R2", 900.0, 4.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
+                   ["N-R3", "N", "R3", 2200.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0]],
+        "params": {"g_modo": "qbomba", "g_qbomba": 30.0, "suc_nivel": 501.0, "suc_cota_eje": 500.0, "suc_alt": 1000.0}},
+}
 ACC0 = pd.DataFrame(columns=["tramo", "tipo", "cant", "K"])
 CLASES_TODAS = sorted({c for m in bc.CLASES.values() for c in m} | {"Única"})
 
 PARAMS = {
-    "g_modo": "qbomba", "g_pob": 0.0, "g_dot": 150.0, "g_qmed": 8.0, "g_qmd": 12.0, "g_qmh": 20.0,
-    "g_qbomba": 18.0, "g_mapas": True, "g_cvd": 1.4, "g_cvh": 1.55, "g_kmin": 0.5, "g_cs": 1.5, "g_M": 2.0,
+    "g_modo": "qbomba", "g_pob": 0.0, "g_dot": 150.0, "g_qmed": 0.0, "g_qmd": 0.0, "g_qmh": 0.0,
+    "g_qbomba": 0.0, "g_mapas": True, "g_cvd": 1.4, "g_cvh": 1.55, "g_kmin": 0.5, "g_cs": 1.5, "g_M": 2.0,
     "g_horas": 24.0, "g_tanque": True,
     "metodo": "DW", "edad_anios": 0, "grupo_agua": "II", "a_usuario": 0.0,
     "modo_menores": "pct", "pct_menores": 0.10, "colchon_min_m": 0.90,
@@ -47,8 +75,8 @@ PARAMS = {
     "criterio_dn": "bresse", "v_obj": 1.5, "J_max_m_km": 4.0, "usar_opt": False, "tc_s": 0.0,
     "n_bombas": 1, "eficiencia_bomba": 0.65, "eficiencia_motor": 0.92, "factor_seguridad_motor": 1.15,
     "npsh_requerido": 0.0, "p_min_kgcm2": 1.5, "p_max_kgcm2": 5.0, "v_min": 0.3, "v_max": 5.0,
-    "suc_nivel": 291.33, "suc_cota_eje": 290.41, "suc_L": 6.0, "suc_dn": 8.0, "suc_mat": "PVC C-900",
-    "suc_clase": "RD 25", "suc_alt": 2240.0, "suc_temp": 20.0,
+    "suc_nivel": 0.0, "suc_cota_eje": 0.0, "suc_L": 6.0, "suc_dn": 8.0, "suc_mat": "PVC C-900",
+    "suc_clase": "RD 25", "suc_alt": 0.0, "suc_temp": 20.0,
 }
 ss = st.session_state
 ss.setdefault("ver", 0)
@@ -246,7 +274,28 @@ with t_gas:
     st.caption("Qmed, QMD y QMH son los gastos de agua potable. Qmín, Qmáx inst. y Qmáx ext. se muestran como referencia "
                "(definiciones de MAPAS de alcantarillado); no gobiernan el cálculo del booster. Verifica coeficientes con tu edición de MAPAS.")
 
+def nuevo_proyecto(nodos=None, tramos=None, params=None):
+    """Se ejecuta como callback (on_click): puede modificar las claves de los widgets antes de que se dibujen."""
+    ss.nodos_base = pd.DataFrame(nodos, columns=COLS_N) if nodos else NODOS0
+    ss.tramos_base = pd.DataFrame(tramos, columns=COLS_T) if tramos else TRAMOS0
+    ss.acc_base, ss.perfiles = ACC0, {}
+    ss.mat_base = pd.DataFrame(columns=MATCOLS)
+    for k, v in PARAMS.items():
+        ss[k] = (params or {}).get(k, v)
+    ss.pop("exp_cfg", None)
+    ss.ver += 1
+
+
+def cb_ejemplo():
+    e = EJEMPLOS[ss.ej_sel]
+    nuevo_proyecto(e["nodos"], e["tramos"], e["params"])
+
+
 with t_red:
+    e1, e2, e3 = st.columns([3, 1, 1])
+    e1.selectbox("Ejemplos (solo como punto de partida)", list(EJEMPLOS), key="ej_sel", label_visibility="collapsed")
+    e2.button("Cargar ejemplo", width="stretch", on_click=cb_ejemplo)
+    e3.button("Proyecto en blanco", width="stretch", on_click=nuevo_proyecto)
     st.subheader("Nodos")
     st.caption("`cota` = terreno (msnm). `demanda_lps` = consumo fijo en un nodo intermedio (opcional). "
                "`p_req_m` = presión deseada propia del nodo (vacío = la global).")
@@ -315,13 +364,17 @@ def build_cfg():
 
 
 err, cfg, res = None, None, None
-try:
-    cfg = build_cfg()
-    if ss.usar_opt:
-        cfg = bc.optimiza_diametros(cfg)
-    res = bc.analizar(cfg)
-except Exception as e:                               # noqa: BLE001
-    err = e
+blanco = not [x for x in nodos_df["id"].dropna()] or not [x for x in tramos_df["id"].dropna()]
+if blanco:
+    err = "Proyecto en blanco: captura al menos un nodo y un tramo en la pestaña Red, o carga un ejemplo."
+else:
+    try:
+        cfg = build_cfg()
+        if ss.usar_opt:
+            cfg = bc.optimiza_diametros(cfg)
+        res = bc.analizar(cfg)
+    except Exception as e:                           # noqa: BLE001
+        err = e
 
 with t_perf:
     ids_t2 = [str(x) for x in tramos_df["id"].dropna()]
@@ -361,7 +414,7 @@ with t_perf:
                 del ss.perfiles[tid]
                 st.rerun()
     if err:
-        st.error(f"Revisa los datos de la red: {err}")
+        (st.info if blanco else st.error)(str(err) if blanco else f"Revisa los datos de la red: {err}")
     else:
         tb0 = ex.tablas(cfg, res)
         st.subheader("Profundidad de zanja y cotas de tubería")
@@ -371,6 +424,13 @@ with t_perf:
         for _, r in tb0["Zanja y cotas"].iterrows():
             if r["Obs"]:
                 st.warning(f"Tramo {r['Tramo']}: {r['Obs']}")
+        st.subheader("Esquema de la zanja")
+        st.caption("Sección transversal del tramo elegido con los datos que usa la app: profundidad de zanja (`prof_m`), cama de 5 cm, "
+                   "colchón sobre la clave, ancho de zanja (D ext. + 0.50 m si D ext. < 0.50 m; + 0.60 m en los demás) y cotas resultantes.")
+        tz = st.selectbox("Tramo para la sección de zanja", [t.id for t in res["red"].tramos], key="zanja_sel")
+        fz = ex.zanja_fig(next(t for t in res["red"].tramos if t.id == tz))
+        st.pyplot(fz)
+        plt.close(fz)
         st.subheader("Perfiles de los ramales (terreno, tubería y línea piezométrica)")
         fp = ex.perfiles_fig(res)
         st.pyplot(fp)
@@ -378,8 +438,13 @@ with t_perf:
 
 with t_res:
     if err:
-        st.error(f"Revisa los datos: {err}")
+        (st.info if blanco else st.error)(str(err) if blanco else f"Revisa los datos: {err}")
         st.stop()
+    if ss.suc_nivel == 0 and ss.suc_cota_eje == 0:
+        st.warning("Captura el nivel del agua y la cota del eje de la bomba en «Succión» (barra lateral); "
+                   "ahora valen 0 y el resultado no es válido.")
+    if gas["Qbomba"] <= 0:
+        st.warning("El caudal de bombeo es 0: captura el gasto en la pestaña Gastos.")
     red, dis, nb, lim = res["red"], bc.diseno(res), cfg["n_bombas"], cfg["limites"]
     eq, tb = bc.equipo(cfg, res), ex.tablas(cfg, res)
     for av in res["avisos"]:
