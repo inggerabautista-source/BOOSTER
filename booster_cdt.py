@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 G = 9.81
+VERSION = "4"
 NU = 1.004e-6
 HP_KW = 0.7457
 EV_KGCM2 = 2.06e4                   # módulo de compresibilidad del agua (MAPAS), kg/cm2
