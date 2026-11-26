@@ -15,7 +15,7 @@ from matplotlib.patches import Circle, Patch, Rectangle  # noqa: E402
 import booster_cdt as bc  # noqa: E402
 
 equipo = bc.equipo
-VERSION = "4"
+VERSION = "5"
 _diseno = bc.diseno
 
 
@@ -88,6 +88,9 @@ def tablas(cfg, res, con_alternativas=False):
         ("Potencia al motor", f"{eq['p_kw']:.2f} kW = {eq['hp']:.1f} HP"),
         ("Motor comercial sugerido", f"{eq['hp_com']:g} HP por bomba"),
         ("NPSH disponible", f"{eq['npshd']:.2f} m"),
+        ("Succión (tanque → bomba)",
+         f"{res['tsuc'].dn_pulg:g}\" {res['tsuc'].material}, L = {res['tsuc'].L:g} m, V = {dis['V_succ']:.2f} m/s, "
+         f"pérdidas = {dis['hf_succ']:.2f} m"),
         ("Método de fricción", "Darcy-Weisbach" if cfg["metodo"].upper() == "DW" or edad else "Hazen-Williams"),
         ("Envejecimiento", f"{edad} años, grupo {cfg.get('grupo_agua')}" if edad else "tubería nueva"),
         ("Pérdidas menores", f"{cfg['pct_menores'] * 100:.0f}% de fricción" if cfg.get("modo_menores") != "K"
@@ -142,7 +145,7 @@ def _layout(red):
 
 
 def esquema_fig(cfg, res):
-    red, dis, lim, s = res["red"], _diseno(res), cfg["limites"], cfg["succion"]
+    red, dis, lim, s = res["red"], _diseno(res), cfg["limites"], res.get("succion", cfg["succion"])
     nb, eq, pos = cfg.get("n_bombas", 1), equipo(cfg, res), _layout(res["red"])
     maxd, nh = max(p[0] for p in pos.values()), len(red.terminales())
     fig, ax = plt.subplots(figsize=(max(10, 3.0 * (maxd + 3)), max(4.2, 1.9 * nh + 1.6)))
@@ -193,6 +196,47 @@ def esquema_fig(cfg, res):
     ax.set_aspect("equal", adjustable="datalim")
     ax.axis("off")
     ax.set_title("Esquema general del sistema (no está a escala)", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def esquema_topologia(nodos, tramos):
+    """Vista previa del esquema (solo topología). nodos: [[id,...]] (el primero es la bomba); tramos: [[id, desde, hasta,...]]."""
+    hijos = {}
+    for t in tramos:
+        hijos.setdefault(t[1], []).append(t[2])
+    raiz, pos, cont = nodos[0][0], {}, [0]
+
+    def rec(n, d):
+        hs = hijos.get(n, [])
+        if not hs:
+            y = float(cont[0])
+            cont[0] += 1
+        else:
+            ys = [rec(h, d + 1) for h in hs]
+            y = sum(ys) / len(ys)
+        pos[n] = (d, y)
+        return y
+
+    rec(raiz, 0)
+    nh = max(cont[0], 1)
+    maxd = max(p[0] for p in pos.values())
+    fig, ax = plt.subplots(figsize=(max(5.5, 1.5 * (maxd + 2)), max(2.2, 0.7 * nh + 1.2)))
+    ax.add_patch(Circle((-0.9, pos[raiz][1]), 0.22, fc="#ffd966", ec="k", zorder=3))
+    ax.text(-0.9, pos[raiz][1], "Bomba", ha="center", va="center", fontsize=6.5, zorder=4)
+    ax.plot([-0.68, 0], [pos[raiz][1]] * 2, color="#1f4e79", lw=2)
+    for t in tramos:
+        if t[1] in pos and t[2] in pos:
+            (x1, y1), (x2, y2) = pos[t[1]], pos[t[2]]
+            ax.annotate("", xy=(x2, y2), xytext=(x1, y1), arrowprops=dict(arrowstyle="-|>", lw=2, color="#1f4e79"))
+            ax.text((x1 + x2) / 2, (y1 + y2) / 2 + 0.12, t[0], ha="center", fontsize=7)
+    for n, (x, y) in pos.items():
+        ax.add_patch(Circle((x, y), 0.13, fc="#9be29b" if n != raiz else "#ffd966", ec="k", zorder=4))
+        ax.text(x, y - 0.22, n, ha="center", va="top", fontsize=7)
+    ax.set_xlim(-1.4, maxd + 0.6)
+    ax.set_ylim(-0.7, nh - 0.3 + 0.2)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.axis("off")
     fig.tight_layout()
     return fig
 
