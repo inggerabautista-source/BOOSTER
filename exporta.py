@@ -15,7 +15,7 @@ from matplotlib.patches import Circle, Patch, Rectangle  # noqa: E402
 import booster_cdt as bc  # noqa: E402
 
 equipo = bc.equipo
-VERSION = "5"
+VERSION = "6"
 _diseno = bc.diseno
 
 
@@ -109,6 +109,11 @@ def tablas(cfg, res, con_alternativas=False):
            "Golpe de ariete": ar, "Diámetros": pd.DataFrame(dm), "Accesorios": acc,
            "Perfiles": pd.DataFrame(perf, columns=["Tramo", "Estación m", "Cota"]),
            "Verif. nodos": pd.DataFrame(vn), "Verif. tuberías": pd.DataFrame(vt)}
+    dg = bc.desglose_cdt(cfg, res)
+    out["Desglose CDT"] = pd.DataFrame(dg["desglose"])
+    out["Componentes CDT"] = pd.DataFrame(dg["componentes"])
+    out["Ruta crítica"] = pd.DataFrame(dg["ruta"])
+    out["Succión (detalle)"] = pd.DataFrame(dg["succion"])
     g = cfg.get("gastos")
     if g:
         out["Gastos"] = pd.DataFrame([
@@ -467,7 +472,7 @@ def a_pdf(cfg, res):
         for nombre, f in todas_las_figuras(cfg, res).items():
             pdf.savefig(f, bbox_inches="tight")
             plt.close(f)
-        for nombre in ("Gastos", "Tramos", "Zanja y cotas", "Nodos", "Verif. nodos", "Verif. tuberías", "Curva sistema",
+        for nombre in ("Gastos", "Desglose CDT", "Componentes CDT", "Ruta crítica", "Succión (detalle)", "Tramos", "Zanja y cotas", "Nodos", "Verif. nodos", "Verif. tuberías", "Curva sistema",
                        "Golpe de ariete", "Diámetros", "Alternativas DN"):
             if nombre in tb and len(tb[nombre]):
                 _pag_tabla(pdf, nombre, tb[nombre])
