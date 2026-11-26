@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 G = 9.81
-VERSION = "5"
+VERSION = "6"
 NU = 1.004e-6
 HP_KW = 0.7457
 EV_KGCM2 = 2.06e4                   # módulo de compresibilidad del agua (MAPAS), kg/cm2
@@ -485,6 +485,96 @@ def analizar(cfg: dict) -> dict:
     hfn, hmn, _ = perdida_tramo(ts, nueva["Q"] / nb_, {**c0, "modo_menores": "K"})
     nueva["CDT"] = nueva["H_desc"] - (s["nivel_agua"] - hfn - hmn)
     return {"red": red, "esc": esc, "nueva": nueva, "tsuc": ts, "avisos": avisos, "succion": s}
+
+
+# ----------------------------------------------------------------------------- desglose de la CDT
+def detalle_friccion(t, q_lps, cfg):
+    """Datos de la fricción de un tramo: V, Re, f (o C), rugosidad usada, hf y hm."""
+    hf, hm, V = perdida_tramo(t, q_lps, cfg)
+    D = t.D_mm / 1000.0
+    out = {"V": V, "hf": hf, "hm": hm, "Re": 0.0, "f": 0.0, "C": None, "eps_mm": None, "metodo": "DW"}
+    if q_lps <= 0:
+        return out
+    if cfg.get("metodo", "DW").upper() == "HW" and float(cfg.get("edad_anios", 0) or 0) <= 0:
+        out.update(metodo="HW", C=MATERIALES.get(mat_key(t.material), {"C": 130})["C"])
+        return out
+    eps = eps_tubo_mm(t.material, cfg)
+    Re = V * D / NU
+    out.update(Re=Re, eps_mm=eps, f=64.0 / Re if Re < 2000 else 0.25 / (math.log10(eps / 1000 / (3.7 * D) + 5.74 / Re ** 0.9)) ** 2)
+    return out
+
+
+def desglose_cdt(cfg, res):
+    """Descompone la CDT: succión, ruta crítica y componentes. CDT = H descarga - H succión."""
+    red, dis, s, ts = res["red"], diseno(res), res["succion"], res["tsuc"]
+    nb = max(int(cfg.get("n_bombas", 1)), 1)
+    crit = dis["crit"]
+    ruta, camino, extra = [], [], None
+    if "@" in crit:
+        tid, xs = crit.split("@")
+        t = next(x for x in red.tramos if x.id == tid)
+        px, z_c = min(t.eje, key=lambda p: abs(p[0] - float(xs.rstrip("m"))))
+        p_c, frac = cfg.get("presion_min_perfil_m", 0.0), px / (t.L or 1.0)
+        camino, extra = (red.camino(t.desde) if t.desde != red.raiz else []), (t, frac)
+        nombre = f"punto del perfil de {tid} a {px:.0f} m"
+    else:
+        z_c = red.z_tub[crit]
+        p = red.nodos[crit].p_req_m
+        p_c = cfg["presion_deseada_m"] if _nan(p) else p
+        camino, nombre = red.camino(crit), f"nodo {crit}"
+    hf_r = hm_r = 0.0
+    for t in camino:
+        d = dis["det"][t.id]
+        ruta.append({"Tramo": t.id, "Q lps": d["Q"], "DN pulg": t.dn_pulg, "D int mm": t.D_mm, "L m": t.L,
+                     "V m/s": d["V"], "hf m": d["hf"], "hm m": d["hm"]})
+        hf_r, hm_r = hf_r + d["hf"], hm_r + d["hm"]
+    if extra:
+        t, fr = extra
+        d = dis["det"][t.id]
+        ruta.append({"Tramo": f"{t.id} (hasta {fr * t.L:.0f} m)", "Q lps": d["Q"], "DN pulg": t.dn_pulg, "D int mm": t.D_mm,
+                     "L m": fr * t.L, "V m/s": d["V"], "hf m": d["hf"] * fr, "hm m": d["hm"] * fr})
+        hf_r, hm_r = hf_r + d["hf"] * fr, hm_r + d["hm"] * fr
+    # succión: una línea por bomba, accesorios por K
+    cs = {**cfg, "modo_menores": "K"}
+    Qp = dis["Q"] / nb
+    ds = detalle_friccion(ts, Qp, cs)
+    H_succ = s["nivel_agua"] - ds["hf"] - ds["hm"]
+    H_desc = z_c + p_c + hf_r + hm_r
+    suc = [
+        {"Concepto": "Gasto por bomba (una succión por bomba)", "Valor": Qp, "Unidad": "lps"},
+        {"Concepto": "Material / clase", "Valor": f"{ts.material} {ts.clase}", "Unidad": ""},
+        {"Concepto": "DN / diámetro interior", "Valor": f"{ts.dn_pulg:g}\" / {ts.D_mm:.1f}", "Unidad": "pulg / mm"},
+        {"Concepto": "Longitud tanque → bomba", "Valor": ts.L, "Unidad": "m"},
+        {"Concepto": "Velocidad", "Valor": ds["V"], "Unidad": "m/s"},
+        {"Concepto": "Número de Reynolds", "Valor": ds["Re"], "Unidad": ""},
+        {"Concepto": "Factor de fricción f (Darcy)" if ds["metodo"] == "DW" else "Coeficiente C (Hazen-Williams)",
+         "Valor": ds["f"] if ds["metodo"] == "DW" else ds["C"], "Unidad": ""},
+        {"Concepto": "Rugosidad usada ε", "Valor": ds["eps_mm"], "Unidad": "mm"},
+        {"Concepto": "hf  pérdida por fricción en la succión  [f·(L/D)·V²/2g]", "Valor": ds["hf"], "Unidad": "m"},
+        {"Concepto": "ΣK de accesorios de la succión", "Valor": ts.Ksum, "Unidad": ""},
+        {"Concepto": "hm  pérdidas menores en la succión  [ΣK·V²/2g]", "Valor": ds["hm"], "Unidad": "m"},
+        {"Concepto": "Pérdida total en la succión (hf + hm)", "Valor": ds["hf"] + ds["hm"], "Unidad": "m"},
+        {"Concepto": "Nivel del agua", "Valor": s["nivel_agua"], "Unidad": "msnm"},
+        {"Concepto": "Carga a la entrada de la bomba (nivel − pérdidas)", "Valor": H_succ, "Unidad": "msnm"},
+    ]
+    des = [
+        {"Paso": "1", "Concepto": "Nivel del agua en la succión", "m": s["nivel_agua"], "Nota": "tanque o cárcamo (nivel mínimo)"},
+        {"Paso": "2", "Concepto": "− hf fricción en la succión", "m": -ds["hf"], "Nota": "tabla «Pérdidas en la succión»"},
+        {"Paso": "3", "Concepto": "− hm accesorios en la succión", "m": -ds["hm"], "Nota": "ΣK·V²/2g"},
+        {"Paso": "A", "Concepto": "= H succión (carga a la entrada de la bomba)", "m": H_succ, "Nota": "paso 1 − 2 − 3"},
+        {"Paso": "4", "Concepto": f"Cota de la tubería en el punto crítico ({nombre})", "m": z_c, "Nota": "terreno − profundidad + radio"},
+        {"Paso": "5", "Concepto": "+ Presión requerida en ese punto", "m": p_c, "Nota": "presión deseada (kg/cm² × 10)"},
+        {"Paso": "6", "Concepto": "+ hf fricción en la ruta crítica (Σ)", "m": hf_r, "Nota": "tabla «Ruta crítica»"},
+        {"Paso": "7", "Concepto": "+ hm pérdidas menores en la ruta crítica (Σ)", "m": hm_r, "Nota": "% de hf o ΣK·V²/2g"},
+        {"Paso": "B", "Concepto": "= H descarga (carga requerida a la salida de la bomba)", "m": H_desc, "Nota": "paso 4 + 5 + 6 + 7"},
+        {"Paso": "CDT", "Concepto": "CDT = H descarga − H succión", "m": H_desc - H_succ, "Nota": "B − A"},
+    ]
+    cdt = H_desc - H_succ
+    comp = [("Carga estática (cota crítica − nivel del agua)", z_c - s["nivel_agua"]), ("Presión requerida en el punto crítico", p_c),
+            ("Fricción en la ruta crítica", hf_r), ("Pérdidas menores en la ruta crítica", hm_r),
+            ("Pérdidas en la succión (hf + hm)", ds["hf"] + ds["hm"])]
+    componentes = [{"Componente": n, "m": v, "% de la CDT": 100 * v / cdt if cdt else 0.0} for n, v in comp]
+    return {"desglose": des, "componentes": componentes, "ruta": ruta, "succion": suc, "CDT": cdt}
 
 
 # ----------------------------------------------------------------------------- equipo, curva de bomba
