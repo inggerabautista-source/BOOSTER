@@ -23,10 +23,22 @@ st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide
 
 APP_VERSION = "6"
 if getattr(bc, "VERSION", None) != APP_VERSION or getattr(ex, "VERSION", None) != APP_VERSION:
+    # Streamlit puede conservar en memoria una versión vieja de los módulos: se recargan desde disco (en este orden)
+    import importlib
+    for _m in (bc, ex):
+        importlib.reload(_m)
+if getattr(bc, "VERSION", None) != APP_VERSION or getattr(ex, "VERSION", None) != APP_VERSION:
+    import os
     st.error(
-        "Los archivos no son de la misma versión. Sube a la misma carpeta (reemplazando los anteriores) "
-        f"app_booster.py, booster_cdt.py y exporta.py de la versión {APP_VERSION}. "
-        f"Encontrado: booster_cdt={getattr(bc, 'VERSION', 'antigua')}, exporta={getattr(ex, 'VERSION', 'antigua')}.")
+        f"Los archivos no son de la misma versión (se requiere la {APP_VERSION}). "
+        f"booster_cdt = {getattr(bc, 'VERSION', 'antigua')}, exporta = {getattr(ex, 'VERSION', 'antigua')}.")
+    st.code(f"app            : {os.path.abspath(__file__)}\n"
+            f"booster_cdt.py : {getattr(bc, '__file__', '?')}\n"
+            f"exporta.py     : {getattr(ex, '__file__', '?')}\n"
+            f"carpeta actual : {os.getcwd()}")
+    st.info("Revisa que booster_cdt.py y exporta.py de la versión 6 estén en la MISMA carpeta que este archivo y que no exista "
+            "otra copia de esos archivos en otra carpeta del repositorio (por ejemplo, en la raíz). Después usa "
+            "«Manage app → Reboot app». Las rutas de arriba muestran de dónde se está leyendo cada archivo.")
     st.stop()
 
 MATCOLS = ["nombre", "C", "eps0_mm", "E_kgcm2", "espesor_mm", "P_trab_kgcm2"]
