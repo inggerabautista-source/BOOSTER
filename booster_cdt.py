@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import copy
 import math
+
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 
 G = 9.81
-VERSION = "4"
+VERSION = "5"
 NU = 1.004e-6
 HP_KW = 0.7457
 EV_KGCM2 = 2.06e4                   # módulo de compresibilidad del agua (MAPAS), kg/cm2
@@ -308,46 +310,44 @@ def perdida_tramo(t, q_lps: float, cfg: dict):
 
 # ----------------------------------------------------------------------------- reparto de gasto
 class Hidraulica:
-    """Calcula el reparto de gasto por ramal (fijo / % / equilibrio hidráulico) y la carga requerida."""
+    """Reparto de gasto por ramal (fijo / % / equilibrio hidráulico) usando tablas de carga requerida.
 
-    def __init__(self, red: Red, cfg: dict):
+    Para cada nodo se tabula, en una malla de gastos, la carga que necesita para recibir ese gasto aguas arriba
+    (hojas: carga fija; tramos: carga del nodo hijo + pérdidas, o el punto alto del perfil si gobierna). El
+    equilibrio entre ramales 'auto' se resuelve con interpolación, de modo que el tiempo crece linealmente con
+    el número de nodos (sin anidar bisecciones)."""
+
+    def __init__(self, red: Red, cfg: dict, Qtot: float, M: int = 61):
         self.red, self.cfg = red, cfg
         self.pperf = cfg.get("presion_min_perfil_m", 0.0)
-
-    def perd(self, t, Q):
-        hf, hm, _ = perdida_tramo(t, Q, self.cfg)
-        return hf + hm
+        self.Qg = np.linspace(0.0, max(Qtot, 1e-9), M)
+        self.F, self.U = {}, {}
+        self._build(red.raiz)
 
     def p_req(self, n):
         p = self.red.nodos[n].p_req_m
         return self.cfg["presion_deseada_m"] if _nan(p) else p
 
-    def H_up(self, t, Q):
-        """Carga requerida aguas arriba del tramo para pasar Q (incluye puntos altos del perfil)."""
-        perd = self.perd(t, Q)
-        h = self.H_req(t.hasta, Q) + perd
-        for x, z in t.eje:
-            h = max(h, z + self.pperf + (perd * x / t.L if t.L > 0 else 0.0))
-        return h
+    def _loss_vec(self, t):
+        return np.array([sum(perdida_tramo(t, float(q), self.cfg)[:2]) for q in self.Qg])
 
-    def H_req(self, n, Q):
-        if not self.red.hijos.get(n):
-            return self.red.z_tub[n] + self.p_req(n)
-        return self.reparto(n, Q)[1]
-
-    def Q_de_H(self, t, H, Qmax):
-        if Qmax <= 0 or self.H_up(t, 0.0) >= H:
-            return 0.0
-        if self.H_up(t, Qmax) <= H:
-            return Qmax
-        lo, hi = 0.0, Qmax
-        for _ in range(40):
-            mid = (lo + hi) / 2
-            lo, hi = (mid, hi) if self.H_up(t, mid) < H else (lo, mid)
-        return (lo + hi) / 2
-
-    def reparto(self, n, Q):
+    def _build(self, n):
         red = self.red
+        hs = red.hijos.get(n, [])
+        if not hs:
+            self.F[n] = np.full(len(self.Qg), red.z_tub[n] + self.p_req(n))
+            return
+        for t in hs:
+            self._build(t.hasta)
+            L = self._loss_vec(t)
+            h = self.F[t.hasta] + L
+            for x, z in t.eje:
+                h = np.maximum(h, z + self.pperf + L * (x / t.L if t.L > 0 else 0.0))
+            self.U[t.id] = np.maximum.accumulate(h)
+        self.F[n] = np.array([self.split(n, float(q))[1] for q in self.Qg])
+
+    def split(self, n, Q):
+        red, Qg, U = self.red, self.Qg, self.U
         nodo = red.nodos[n]
         d = 0.0 if _nan(nodo.demanda_lps) else nodo.demanda_lps
         Qout = max(Q - d, 0.0)
@@ -362,21 +362,21 @@ class Hidraulica:
                 autos.append(t)
         for t in hs:
             if t.id in q:
-                Hn = max(Hn, self.H_up(t, q[t.id]))
+                Hn = max(Hn, float(np.interp(q[t.id], Qg, U[t.id])))
         Qr = max(Qout - sum(q.values()), 0.0)
         if autos:
             if len(autos) == 1:
                 q[autos[0].id] = Qr
-                Ha = self.H_up(autos[0], Qr)
+                Ha = float(np.interp(Qr, Qg, U[autos[0].id]))
             else:
-                lo = min(self.H_up(t, 0.0) for t in autos)
-                hi = max(self.H_up(t, Qr) for t in autos) + 1e-6
-                for _ in range(40):
+                lo = min(float(U[t.id][0]) for t in autos)
+                hi = max(float(np.interp(Qr, Qg, U[t.id])) for t in autos) + 1e-6
+                for _ in range(50):
                     mid = (lo + hi) / 2
-                    s = sum(self.Q_de_H(t, mid, Qr) for t in autos)
-                    lo, hi = (mid, hi) if s < Qr else (lo, mid)
+                    s_ = sum(min(float(np.interp(mid, U[t.id], Qg)), Qr) for t in autos)
+                    lo, hi = (mid, hi) if s_ < Qr else (lo, mid)
                 Ha = (lo + hi) / 2
-                qa = {t.id: self.Q_de_H(t, Ha, Qr) for t in autos}
+                qa = {t.id: min(float(np.interp(Ha, U[t.id], Qg)), Qr) for t in autos}
                 tot = sum(qa.values()) or 1.0
                 q.update({k: v * Qr / tot for k, v in qa.items()})
             Hn = max(Hn, Ha)
@@ -390,7 +390,7 @@ class Hidraulica:
         def rec(n, Q):
             if not self.red.hijos.get(n):
                 return
-            q, _ = self.reparto(n, Q)
+            q, _ = self.split(n, Q)
             for t in self.red.hijos[n]:
                 flows[t.id] = q[t.id]
                 rec(t.hasta, q[t.id])
@@ -399,9 +399,20 @@ class Hidraulica:
         return flows
 
 
+class _HidCero:
+    """Caso de gasto cero (solo necesita p_req y pperf)."""
+
+    def __init__(self, red, cfg):
+        self.red, self.cfg, self.pperf = red, cfg, cfg.get("presion_min_perfil_m", 0.0)
+
+    def p_req(self, n):
+        p = self.red.nodos[n].p_req_m
+        return self.cfg["presion_deseada_m"] if _nan(p) else p
+
+
 def resolver(red: Red, k: float, cfg: dict) -> dict:
-    hid = Hidraulica(red, cfg)
     Qtot = cfg["Q_bombeo_lps"] * k
+    hid = Hidraulica(red, cfg, Qtot) if Qtot > 0 else _HidCero(red, cfg)
     q = hid.asigna(Qtot) if Qtot > 0 else {t.id: 0.0 for t in red.tramos}
     acum, det, pila = {red.raiz: 0.0}, {}, [red.raiz]
     while pila:
@@ -441,7 +452,11 @@ def analizar(cfg: dict) -> dict:
     nodos = [Nodo(**n) for n in cfg["nodos"]]
     tramos = [Tramo(**t) for t in cfg["tramos"]]
     red = Red(nodos, tramos, cfg["raiz"], cfg)
-    s = cfg["succion"]
+    s = dict(cfg["succion"])
+    nb_ = max(int(cfg.get("n_bombas", 1)), 1)
+    if s.get("auto_dn"):
+        s["dn_pulg"] = dn_succion(cfg["Q_bombeo_lps"] / nb_, s.get("material", "PVC C-900"), s.get("clase", "RD 25"),
+                                  s.get("v_max", 1.5))
     ts = Tramo("succion", "tanque", "bomba", s.get("L", 0.0), s["dn_pulg"], s.get("material", "PVC C-900"),
                s.get("clase", "RD 25"), None, s.get("K", 0.0))
     ksuc = sum(float(a["cant"]) * float(a["K"]) for a in cfg.get("accesorios", []) or [] if a["tramo"] == "succion")
@@ -449,19 +464,27 @@ def analizar(cfg: dict) -> dict:
     avisos = [t.aviso for t in tramos + [ts] if t.aviso]
     if cfg.get("metodo", "DW").upper() == "HW" and (cfg.get("edad_anios", 0) or 0) > 0:
         avisos.append("Con tubería envejecida se usa Darcy-Weisbach (eps_t = eps_0 + a·t); Hazen-Williams solo aplica a tubería nueva.")
+    for t in tramos:                                 # coherencia entre L y la longitud del perfil
+        if t.perfil and len(t.perfil) >= 2:
+            pf = sorted(float(p[0]) for p in t.perfil)
+            span = pf[-1] - pf[0]
+            if span > 0 and abs(t.L - span) / span > 0.01:
+                avisos.append(f"Tramo {t.id}: L = {t.L:g} m no coincide con la longitud del perfil ({span:.2f} m); "
+                              "el perfil se reescala a L. Corrige L o el perfil.")
     esc = []
+    cs = {**cfg, "modo_menores": "K"}                # en la succión mandan los accesorios (K), no un % de la fricción
     for k in cfg["escenarios"]:
         r = resolver(red, k, cfg)
-        hf, hm, vs = perdida_tramo(ts, r["Q"], cfg)
+        hf, hm, vs = perdida_tramo(ts, r["Q"] / nb_, cs)
         r["hf_succ"], r["V_succ"] = hf + hm, vs
         r["H_succ"] = s["nivel_agua"] - r["hf_succ"]
         r["CDT"] = r["H_desc"] - r["H_succ"]
         esc.append(r)
     c0 = {**cfg, "edad_anios": 0}
     nueva = resolver(red, 1.0, c0)
-    hfn, hmn, _ = perdida_tramo(ts, nueva["Q"], c0)
+    hfn, hmn, _ = perdida_tramo(ts, nueva["Q"] / nb_, {**c0, "modo_menores": "K"})
     nueva["CDT"] = nueva["H_desc"] - (s["nivel_agua"] - hfn - hmn)
-    return {"red": red, "esc": esc, "nueva": nueva, "tsuc": ts, "avisos": avisos}
+    return {"red": red, "esc": esc, "nueva": nueva, "tsuc": ts, "avisos": avisos, "succion": s}
 
 
 # ----------------------------------------------------------------------------- equipo, curva de bomba
@@ -597,6 +620,16 @@ def verifica_presiones(cfg, res):
     return nodos, tub, ok
 
 
+def dn_succion(Q_bomba_lps, material, clase, v_max=1.5):
+    """Menor DN comercial cuya velocidad en la succión no excede v_max (MAPAS, diseño de instalaciones mecánicas:
+    velocidad recomendada en la línea de succión 1.5 m/s). Cada bomba lleva su propia línea de succión."""
+    for dn in dn_lista(material):
+        D = geometria(material, dn, clase)["D_int"] / 1000
+        if Q_bomba_lps / 1000 / (math.pi * D ** 2 / 4) <= v_max:
+            return dn
+    return dn_lista(material)[-1]
+
+
 # ----------------------------------------------------------------------------- diámetros
 def dn_optimo(Q_lps, material, clase, cfg):
     """Diámetro óptimo (criterio en cfg['criterio_dn']):
@@ -700,7 +733,7 @@ EJEMPLO = {
     "nodos": [{"id": "B", "cota": 290.41}, {"id": "T", "cota": 290.96},
               {"id": "Pte", "cota": 303.00}, {"id": "Ote", "cota": 279.65}],
     "tramos": [
-        {"id": "B-T", "desde": "B", "hasta": "T", "L": 42.0, "dn_pulg": 6.0},
+        {"id": "B-T", "desde": "B", "hasta": "T", "L": 33.0, "dn_pulg": 6.0},
         {"id": "T-Pte", "desde": "T", "hasta": "Pte", "L": 3474.55, "dn_pulg": 6.0, "modo": "lps", "valor": 12},
         {"id": "T-Ote", "desde": "T", "hasta": "Ote", "L": 2007.40, "dn_pulg": 4.0, "modo": "lps", "valor": 6}],
     "succion": {"nivel_agua": 291.33, "cota_eje_bomba": 290.41, "L": 6.0, "dn_pulg": 8, "altitud_m": 2240, "temp_c": 20},
