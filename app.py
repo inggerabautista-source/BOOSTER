@@ -21,7 +21,7 @@ import exporta as ex
 
 st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide")
 
-APP_VERSION = "5"
+APP_VERSION = "6"
 if getattr(bc, "VERSION", None) != APP_VERSION or getattr(ex, "VERSION", None) != APP_VERSION:
     st.error(
         "Los archivos no son de la misma versión. Sube a la misma carpeta (reemplazando los anteriores) "
@@ -583,6 +583,38 @@ with t_res:
              f"{' (automático)' if ss.suc_auto else ''}, L = {ts_.L:g} m, V = {vs_:.2f} m/s, pérdidas = {dis['hf_succ']:.2f} m "
              f"(ΣK = {ts_.Ksum:.2f}). Velocidad recomendada ≤ {ss.suc_vmax:g} m/s.")
     (st.success if vs_ <= ss.suc_vmax + 1e-9 else st.warning)(msg_s)
+    dg = bc.desglose_cdt(cfg, res)
+    st.subheader("Cómo se calcula la CDT")
+    st.markdown("**CDT = H descarga − H succión**, donde *H succión* = nivel del agua − pérdidas de la succión, y "
+                "*H descarga* = cota de tubería del punto crítico + presión requerida + pérdidas de la ruta crítica.")
+    cc1, cc2 = st.columns([3, 2])
+    cc1.dataframe(pd.DataFrame(dg["desglose"]).round(3), width="stretch", hide_index=True)
+    cc2.dataframe(pd.DataFrame(dg["componentes"]).round(2), width="stretch", hide_index=True)
+    st.markdown("**Ruta crítica** (tramos desde la bomba hasta el punto que gobierna)")
+    st.dataframe(pd.DataFrame(dg["ruta"]).round(3), width="stretch", hide_index=True)
+    st.markdown("**Pérdidas en la succión (hf y hm)**")
+    sdf = pd.DataFrame(dg["succion"])
+    sdf["Valor"] = sdf["Valor"].apply(lambda v: f"{v:,.3f}" if isinstance(v, float) else ("" if v is None else str(v)))
+    st.dataframe(sdf, width="stretch", hide_index=True)
+    with st.expander("Notas y tips sobre la CDT", expanded=False):
+        st.markdown("""
+**Cómo se obtiene**
+1. **Succión:** `H succión = nivel del agua − (hf + hm)`. Cada bomba tiene su propia línea; el gasto es el de una bomba.
+2. **Punto crítico:** para cada nodo final (y cada punto alto del perfil) se calcula `cota de tubería + presión requerida + pérdidas del camino desde la bomba`. El mayor valor es la **carga en la descarga** y ese punto gobierna.
+3. **Pérdidas:** `hf = f·(L/D)·V²/2g` (Darcy-Weisbach, f por Swamee-Jain; con años de servicio se usa la rugosidad envejecida ε₀ + a·t). `hm` = % de hf **o** `ΣK·V²/2g` según elijas.
+4. **CDT** = `H descarga − H succión`. Equivale a: *estática + presión requerida + fricción + menores + pérdidas de succión*.
+5. Se calcula para cada escenario de gasto; el **de diseño** es el de mayor gasto. No se incluye la diferencia de carga de velocidad entre entrada y salida de la bomba (suele ser menor a 0.1 m).
+
+**Tips**
+- La **tabla de componentes** muestra qué pesa más. Si domina la fricción, aumentar el diámetro del tramo de mayor hf baja la CDT y la potencia (pestaña Diámetros muestra ΔCDT y ΔHP).
+- Si el punto crítico dice `tramo@xxx m`, gobierna un **punto alto del perfil**, no el extremo: revisa ese punto o ajusta la profundidad de zanja ahí.
+- La **tubería envejecida** y la presión deseada alta aumentan la CDT; revisa que no sean mayores a lo necesario.
+- En la **succión** los accesorios (K) y una línea larga o de diámetro chico restan carga y bajan el NPSH disponible: mantén la succión corta, con pocos codos y velocidad ≤ 1.5 m/s.
+- Los ramales con **presión sobrante** (nodos en naranja) no suben la CDT, pero requieren válvula reductora o de control de flujo.
+- Potencia hidráulica ≈ `Q × CDT / 102` (kW, con Q en lps). Cada metro de CDT en 10 lps son unos 0.1 kW hidráulicos (≈ 0.16 kW al motor con eficiencia global de 60 %).
+- La consigna de presión del variador en la descarga es `H descarga − cota de tubería de la bomba`.
+- Si cambias la longitud, el diámetro o la cota de un tramo, revisa que el perfil y la tabla coincidan (la app avisa).
+""")
     st.subheader("Esquema general")
     st.caption("El gasto de cada ramal se reparte según el modo elegido (auto / % / lps); con ese gasto se calculan velocidad y "
                "pérdidas; la presión deseada en el nodo crítico fija la carga en la bomba; los demás nodos reciben la presión que "
