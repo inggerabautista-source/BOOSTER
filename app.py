@@ -21,7 +21,7 @@ import exporta as ex
 
 st.set_page_config(page_title="Booster - CDT a presión constante", layout="wide")
 
-APP_VERSION = "4"
+APP_VERSION = "5"
 if getattr(bc, "VERSION", None) != APP_VERSION or getattr(ex, "VERSION", None) != APP_VERSION:
     st.error(
         "Los archivos no son de la misma versión. Sube a la misma carpeta (reemplazando los anteriores) "
@@ -33,19 +33,65 @@ MATCOLS = ["nombre", "C", "eps0_mm", "E_kgcm2", "espesor_mm", "P_trab_kgcm2"]
 MAT_BASE = ["PVC C-900", "PVC IPS", "PEAD", "ACERO", "FODU"]
 COLS_N = ["id", "cota", "demanda_lps", "p_req_m"]
 COLS_T = ["id", "desde", "hasta", "L", "dn_pulg", "material", "clase", "prof_m", "K", "modo", "valor"]
-NODOS0 = pd.DataFrame({"id": pd.Series(dtype="object"), "cota": pd.Series(dtype="float"),
-                       "demanda_lps": pd.Series(dtype="float"), "p_req_m": pd.Series(dtype="float")})
-TRAMOS0 = pd.DataFrame({"id": pd.Series(dtype="object"), "desde": pd.Series(dtype="object"),
-                        "hasta": pd.Series(dtype="object"), "L": pd.Series(dtype="float"),
-                        "dn_pulg": pd.Series(dtype="float"), "material": pd.Series(dtype="object"),
-                        "clase": pd.Series(dtype="object"), "prof_m": pd.Series(dtype="float"),
-                        "K": pd.Series(dtype="float"), "modo": pd.Series(dtype="object"),
-                        "valor": pd.Series(dtype="float")})
 NAN = float("nan")
+ESQ_DIRECTO = "Directo a la bomba (un solo tramo)"
+ESQ_CONSUMOS = "Línea con consumos intermedios"
+ESQ_TY = "T o Y (dos ramales)"
+ESQ_VARIOS = "Varios ramales desde un nodo (3 o más)"
+ESQ_SUB = "T o Y con subramal (un ramal que se vuelve a dividir)"
+ESQ_ESPINA = "Troncal con derivaciones (espina de pescado)"
+ESQUEMAS = [ESQ_DIRECTO, ESQ_CONSUMOS, ESQ_TY, ESQ_VARIOS, ESQ_SUB, ESQ_ESPINA]
+ESQ_AYUDA = {
+    ESQ_DIRECTO: "Lo más común: la bomba alimenta una sola línea hasta el punto de entrega.",
+    ESQ_CONSUMOS: "Una sola línea con tomas o consumos a lo largo (se captura el gasto de cada toma en `demanda_lps`).",
+    ESQ_TY: "La línea de la bomba se divide en dos ramales en un nodo. T e Y son iguales para el cálculo hidráulico.",
+    ESQ_VARIOS: "Un nodo del que salen 3 o más ramales (trifurcación, pata de ganso).",
+    ESQ_SUB: "Un nodo se divide en un ramal simple y otro que vuelve a dividirse en dos.",
+    ESQ_ESPINA: "Una línea troncal con varias derivaciones, cada una con su ramal.",
+}
+
+
+def plantilla(tipo, n=2):
+    """Devuelve (filas de nodos, filas de tramos) con la estructura del esquema y los datos por capturar vacíos."""
+    N, T = [["B", NAN, 0.0, NAN]], []
+
+    def nd(i):
+        N.append([i, NAN, 0.0, NAN])
+
+    def tr(d, h):
+        T.append([f"{d}-{h}", d, h, NAN, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0])
+
+    if tipo == ESQ_DIRECTO:
+        nd("F"); tr("B", "F")
+    elif tipo == ESQ_CONSUMOS:
+        ids = [f"C{k}" for k in range(1, n + 1)] + ["F"]
+        prev = "B"
+        for x in ids:
+            nd(x); tr(prev, x); prev = x
+    elif tipo in (ESQ_TY, ESQ_VARIOS):
+        nd("N"); tr("B", "N")
+        for k in range(1, (2 if tipo == ESQ_TY else n) + 1):
+            nd(f"R{k}"); tr("N", f"R{k}")
+    elif tipo == ESQ_SUB:
+        nd("N1"); tr("B", "N1"); nd("R1"); tr("N1", "R1"); nd("N2"); tr("N1", "N2")
+        nd("R2"); tr("N2", "R2"); nd("R3"); tr("N2", "R3")
+    else:                                            # espina de pescado
+        prev = "B"
+        for k in range(1, n + 1):
+            nd(f"N{k}"); tr(prev, f"N{k}"); prev = f"N{k}"
+        nd("F"); tr(prev, "F")
+        for k in range(1, n + 1):
+            nd(f"D{k}"); tr(f"N{k}", f"D{k}")
+    return N, T
+
+
+_N0, _T0 = plantilla(ESQ_DIRECTO)
+NODOS0 = pd.DataFrame(_N0, columns=COLS_N)
+TRAMOS0 = pd.DataFrame(_T0, columns=COLS_T)
 EJEMPLOS = {
     "Red en T (2 ramales)": {
         "nodos": [["B", 290.41, 0.0, NAN], ["T", 290.96, 0.0, NAN], ["Pte", 303.00, 0.0, NAN], ["Ote", 279.65, 0.0, NAN]],
-        "tramos": [["B-T", "B", "T", 42.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
+        "tramos": [["B-T", "B", "T", 33.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0],
                    ["T-Pte", "T", "Pte", 3474.55, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "lps", 12.0],
                    ["T-Ote", "T", "Ote", 2007.40, 4.0, "PVC C-900", "RD 25", NAN, 0.0, "lps", 6.0]],
         "params": {"g_modo": "qbomba", "g_qbomba": 18.0, "suc_nivel": 291.33, "suc_cota_eje": 290.41, "suc_alt": 2240.0}},
@@ -62,7 +108,8 @@ EJEMPLOS = {
                    ["N-R3", "N", "R3", 2200.0, 6.0, "PVC C-900", "RD 25", NAN, 0.0, "auto", 0.0]],
         "params": {"g_modo": "qbomba", "g_qbomba": 30.0, "suc_nivel": 501.0, "suc_cota_eje": 500.0, "suc_alt": 1000.0}},
 }
-ACC0 = pd.DataFrame(columns=["tramo", "tipo", "cant", "K"])
+ACC0 = pd.DataFrame([["succion", "Entrada de borde vivo", 1.0, 0.5], ["succion", "Válvula compuerta abierta", 1.0, 0.2],
+                     ["succion", "Codo 90° radio largo", 1.0, 0.6]], columns=["tramo", "tipo", "cant", "K"])
 CLASES_TODAS = sorted({c for m in bc.CLASES.values() for c in m} | {"Única"})
 
 PARAMS = {
@@ -75,7 +122,7 @@ PARAMS = {
     "criterio_dn": "bresse", "v_obj": 1.5, "J_max_m_km": 4.0, "usar_opt": False, "tc_s": 0.0,
     "n_bombas": 1, "eficiencia_bomba": 0.65, "eficiencia_motor": 0.92, "factor_seguridad_motor": 1.15,
     "npsh_requerido": 0.0, "p_min_kgcm2": 1.5, "p_max_kgcm2": 5.0, "v_min": 0.3, "v_max": 5.0,
-    "suc_nivel": 0.0, "suc_cota_eje": 0.0, "suc_L": 6.0, "suc_dn": 8.0, "suc_mat": "PVC C-900",
+    "suc_nivel": 0.0, "suc_cota_eje": 0.0, "suc_L": 10.0, "suc_auto": True, "suc_vmax": 1.5, "suc_dn": 8.0, "suc_mat": "PVC C-900",
     "suc_clase": "RD 25", "suc_alt": 0.0, "suc_temp": 20.0,
 }
 ss = st.session_state
@@ -206,13 +253,21 @@ MATS = MAT_BASE + [str(n).upper().strip() for n in mat_df["nombre"].dropna() if 
 with sb.expander("Succión"):
     st.number_input("Nivel de agua mínimo (msnm)", key="suc_nivel", format="%.2f")
     st.number_input("Cota del eje de la bomba (msnm)", key="suc_cota_eje", format="%.2f")
-    st.number_input("Longitud (m)", 0.0, 500.0, key="suc_L")
+    st.number_input("Longitud tanque → bomba (m)", 0.0, 500.0, key="suc_L",
+                    help="MAPAS no fija una longitud: la succión debe ser lo más corta posible. Valor preliminar 10 m: "
+                         "captura la distancia real del tanque (o cárcamo) a la bomba.")
     st.selectbox("Material", MATS, key="suc_mat")
-    st.selectbox("DN (pulg)", bc.DN_LISTA, key="suc_dn")
     st.selectbox("Clase", CLASES_TODAS, key="suc_clase")
+    st.checkbox("DN de succión automático", key="suc_auto",
+                help="Elige el menor DN comercial con velocidad ≤ la máxima de succión (1.5 m/s recomendada en MAPAS, "
+                     "diseño de instalaciones mecánicas). Cada bomba lleva su propia succión.")
+    st.number_input("Velocidad máxima en la succión (m/s)", 0.3, 3.0, step=0.1, key="suc_vmax")
+    if not ss.suc_auto:
+        st.selectbox("DN (pulg)", bc.DN_LISTA, key="suc_dn")
     st.number_input("Altitud del sitio (msnm)", 0.0, 5000.0, key="suc_alt")
     st.number_input("Temperatura del agua (°C)", 0.0, 60.0, key="suc_temp")
-    st.caption("Accesorios de la succión: en la pestaña Red, tramo «succion».")
+    st.caption("Accesorios de la succión (entrada, válvula, codo...): tabla de accesorios en la pestaña Red, tramo «succion». "
+               "Ya trae valores típicos; edítalos con tu arreglo real.")
 with sb.expander("Presión de suministro y velocidades", expanded=True):
     st.number_input("Presión mínima de suministro (kg/cm²)", 0.0, 20.0, step=0.1, key="p_min_kgcm2",
                     help="Predeterminado 1.5 kg/cm² (15 m.c.a.).")
@@ -276,12 +331,23 @@ with t_gas:
 
 def nuevo_proyecto(nodos=None, tramos=None, params=None):
     """Se ejecuta como callback (on_click): puede modificar las claves de los widgets antes de que se dibujen."""
-    ss.nodos_base = pd.DataFrame(nodos, columns=COLS_N) if nodos else NODOS0
-    ss.tramos_base = pd.DataFrame(tramos, columns=COLS_T) if tramos else TRAMOS0
+    ss.nodos_base = pd.DataFrame(nodos, columns=COLS_N) if nodos else NODOS0.copy()
+    ss.tramos_base = pd.DataFrame(tramos, columns=COLS_T) if tramos else TRAMOS0.copy()
     ss.acc_base, ss.perfiles = ACC0, {}
     ss.mat_base = pd.DataFrame(columns=MATCOLS)
     for k, v in PARAMS.items():
         ss[k] = (params or {}).get(k, v)
+    ss.pop("exp_cfg", None)
+    ss.ver += 1
+
+
+def cb_plantilla():
+    """Solo reemplaza las tablas de nodos y tramos (conserva gastos, succión y demás parámetros)."""
+    k_ = {ESQ_CONSUMOS: "esq_n_consumos", ESQ_VARIOS: "esq_n_varios", ESQ_ESPINA: "esq_n_espina"}.get(ss.esq_tipo)
+    n = ss[k_] if k_ and k_ in ss else 2
+    N, T = plantilla(ss.esq_tipo, int(n))
+    ss.nodos_base, ss.tramos_base = pd.DataFrame(N, columns=COLS_N), pd.DataFrame(T, columns=COLS_T)
+    ss.acc_base, ss.perfiles = ACC0, {}
     ss.pop("exp_cfg", None)
     ss.ver += 1
 
@@ -292,10 +358,31 @@ def cb_ejemplo():
 
 
 with t_red:
-    e1, e2, e3 = st.columns([3, 1, 1])
-    e1.selectbox("Ejemplos (solo como punto de partida)", list(EJEMPLOS), key="ej_sel", label_visibility="collapsed")
-    e2.button("Cargar ejemplo", width="stretch", on_click=cb_ejemplo)
-    e3.button("Proyecto en blanco", width="stretch", on_click=nuevo_proyecto)
+    st.subheader("Esquema de la red")
+    st.caption("Elige cómo sale el agua de la bomba. Los ramales son opcionales: lo más común es una línea directa. "
+               "Después puedes agregar o quitar filas libremente en las tablas.")
+    u1, u2 = st.columns([2, 3])
+    with u1:
+        st.selectbox("Tipo de esquema", ESQUEMAS, key="esq_tipo")
+        st.caption(ESQ_AYUDA[ss.esq_tipo])
+        n_esq = 2
+        if ss.esq_tipo == ESQ_CONSUMOS:
+            n_esq = st.number_input("Número de consumos intermedios", 1, 10, 2, key="esq_n_consumos")
+        elif ss.esq_tipo == ESQ_VARIOS:
+            n_esq = st.number_input("Número de ramales", 3, 8, 3, key="esq_n_varios")
+        elif ss.esq_tipo == ESQ_ESPINA:
+            n_esq = st.number_input("Número de derivaciones", 2, 8, 3, key="esq_n_espina")
+        st.button("Crear tablas con este esquema", type="primary", on_click=cb_plantilla, width="stretch")
+        with st.expander("Ejemplos con datos / limpiar"):
+            st.selectbox("Ejemplo", list(EJEMPLOS), key="ej_sel")
+            st.button("Cargar ejemplo con datos", width="stretch", on_click=cb_ejemplo)
+            st.button("Limpiar todo (esquema directo)", width="stretch", on_click=nuevo_proyecto)
+    with u2:
+        pN, pT = plantilla(ss.esq_tipo, int(n_esq))
+        fm = ex.esquema_topologia(pN, pT)
+        st.pyplot(fm)
+        plt.close(fm)
+    st.caption("No se resuelven redes malladas (con circuitos cerrados): el cálculo es para redes ramificadas.")
     st.subheader("Nodos")
     st.caption("`cota` = terreno (msnm). `demanda_lps` = consumo fijo en un nodo intermedio (opcional). "
                "`p_req_m` = presión deseada propia del nodo (vacío = la global).")
@@ -357,6 +444,7 @@ def build_cfg():
         "gastos": gas,
         "succion": {"nivel_agua": ss.suc_nivel, "cota_eje_bomba": ss.suc_cota_eje, "L": ss.suc_L,
                     "dn_pulg": ss.suc_dn, "material": ss.suc_mat, "clase": ss.suc_clase, "K": 0.0,
+                    "auto_dn": ss.suc_auto, "v_max": ss.suc_vmax,
                     "altitud_m": ss.suc_alt, "temp_c": ss.suc_temp},
         "_ui": {k: ss[k] for k in PARAMS},
     }
@@ -365,8 +453,17 @@ def build_cfg():
 
 err, cfg, res = None, None, None
 blanco = not [x for x in nodos_df["id"].dropna()] or not [x for x in tramos_df["id"].dropna()]
+faltan = []
+for r_ in nodos_df.dropna(subset=["id"]).itertuples():
+    if nn(r_.cota) is None:
+        faltan.append(f"nodo {r_.id}: cota")
+for r_ in tramos_df.dropna(subset=["id"]).itertuples():
+    faltan += [f"tramo {r_.id}: {c_}" for c_ in ("desde", "hasta", "L", "dn_pulg") if nn(getattr(r_, c_)) in (None, "")]
 if blanco:
-    err = "Proyecto en blanco: captura al menos un nodo y un tramo en la pestaña Red, o carga un ejemplo."
+    err = "Proyecto en blanco: elige un esquema en la pestaña Red o carga un ejemplo."
+elif faltan:
+    blanco = True
+    err = "Faltan datos por capturar en la pestaña Red: " + "; ".join(faltan[:12]) + (" ..." if len(faltan) > 12 else "")
 else:
     try:
         cfg = build_cfg()
@@ -376,11 +473,20 @@ else:
     except Exception as e:                           # noqa: BLE001
         err = e
 
+def persistir_tablas(tid, L_nueva):
+    """Conserva lo capturado en las tablas y cambia la L de un tramo (reinicia los editores con ver+1)."""
+    df = tramos_df.copy()
+    df.loc[df["id"] == tid, "L"] = round(float(L_nueva), 2)
+    ss.tramos_base, ss.nodos_base, ss.acc_base = df, nodos_df.copy(), acc_df.copy()
+    ss.ver += 1
+
+
 with t_perf:
     ids_t2 = [str(x) for x in tramos_df["id"].dropna()]
     st.write("Carga el perfil del terreno de un tramo desde **PDF** (tabla/texto de estación y cota) o **CSV/TXT**. "
              "Si el PDF es solo dibujo, expórtalo a tabla desde tu software de topografía/CAD. "
              "Sin perfil, el tramo usa la línea recta entre las cotas de sus nodos.")
+    st.checkbox("Al asignar un perfil, ajustar la longitud L del tramo a la longitud del perfil", key="aj_L", value=True)
     t_sel = st.selectbox("Tramo", ids_t2) if ids_t2 else None
     upf = st.file_uploader("Perfil del terreno", type=["pdf", "csv", "txt"], key=f"perf_{t_sel}")
     if t_sel and upf is not None:
@@ -404,15 +510,27 @@ with t_perf:
             prev = st.data_editor(prev, num_rows="dynamic", key=f"prev_{t_sel}_{upf.name}", width="stretch")
             if st.button("Asignar perfil al tramo", type="primary") and len(prev) >= 2:
                 ss.perfiles[t_sel] = prev.dropna().values.tolist()
+                if ss.aj_L:
+                    persistir_tablas(t_sel, ss.perfiles[t_sel][-1][0] - ss.perfiles[t_sel][0][0])
                 st.rerun()
     if ss.perfiles:
+        Ltab = {str(r_.id): nn(r_.L) for r_ in tramos_df.dropna(subset=["id"]).itertuples()}
         for tid, pts in list(ss.perfiles.items()):
             c1, c2 = st.columns([5, 1])
-            c1.write(f"**{tid}**: {len(pts)} puntos, estaciones {pts[0][0]:.0f} a {pts[-1][0]:.0f} m, "
-                     f"cota máx {max(p[1] for p in pts):.2f}")
+            span = pts[-1][0] - pts[0][0]
+            c1.write(f"**{tid}**: {len(pts)} puntos, estaciones {pts[0][0]:.0f} a {pts[-1][0]:.0f} m "
+                     f"(longitud del perfil {span:.2f} m), cota máx {max(p[1] for p in pts):.2f}")
             if c2.button("Quitar", key=f"q_{tid}"):
                 del ss.perfiles[tid]
                 st.rerun()
+            L_ = Ltab.get(tid)
+            if L_ is not None and span > 0 and abs(L_ - span) / span > 0.01:
+                w1, w2 = st.columns([5, 1])
+                w1.warning(f"Tramo {tid}: L de la tabla = {L_:g} m, pero el perfil mide {span:.2f} m. "
+                           "El perfil se reescala a L; corrige el dato que esté mal.")
+                if w2.button(f"Usar {span:.2f} m", key=f"ajL_{tid}"):
+                    persistir_tablas(tid, span)
+                    st.rerun()
     if err:
         (st.info if blanco else st.error)(str(err) if blanco else f"Revisa los datos de la red: {err}")
     else:
@@ -460,6 +578,11 @@ with t_res:
         (st.success if eq["marg"] >= 1 else st.error)(f"Margen de NPSH: {eq['marg']:.2f} m (recomendado ≥ 1 m)")
     if "@" in eq["crit"]:
         st.warning(f"Gobierna un punto intermedio del perfil ({eq['crit']}), no un extremo.")
+    ts_, vs_ = res["tsuc"], dis["V_succ"]
+    msg_s = (f"Succión (tanque → bomba): DN {ts_.dn_pulg:g}\" {ts_.material} {ts_.clase}"
+             f"{' (automático)' if ss.suc_auto else ''}, L = {ts_.L:g} m, V = {vs_:.2f} m/s, pérdidas = {dis['hf_succ']:.2f} m "
+             f"(ΣK = {ts_.Ksum:.2f}). Velocidad recomendada ≤ {ss.suc_vmax:g} m/s.")
+    (st.success if vs_ <= ss.suc_vmax + 1e-9 else st.warning)(msg_s)
     st.subheader("Esquema general")
     st.caption("El gasto de cada ramal se reparte según el modo elegido (auto / % / lps); con ese gasto se calculan velocidad y "
                "pérdidas; la presión deseada en el nodo crítico fija la carga en la bomba; los demás nodos reciben la presión que "
